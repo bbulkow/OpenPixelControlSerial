@@ -1,0 +1,17 @@
+{
+  "opc": {
+    "host": "0.0.0.0",
+    "port": 7890
+  },
+  "target_fps": 60,
+  "outputs": [
+    {
+      "port": "COM4",
+      "protocol": "awa",
+      "baud_rate": 2000000,
+      "led_count": 300,
+      "opc_offset": 0,
+      "pixel_format": "GRB"
+    }
+  ]
+}
