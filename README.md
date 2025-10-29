@@ -30,13 +30,29 @@ Python-based tool for testing serial connections:
 - Test patterns (solid colors, blink, rainbow, chase)
 - Verifies pixel format transformations
 
+### `opc-server-py/` - Python OPC Server
+Python-based OPC server implementation:
+- Full OPC protocol server
+- TCP network interface (standard port 7890)
+- Per-channel single-depth queues for low latency
+- Multi-output support with channel routing
+- Both AWA and Adalight protocol output
+- Debug mode with FPS statistics
+
+### `opc-test/` - OPC Test Client
+Shared test client for validating OPC servers:
+- Works with both Python and Rust implementations
+- Multiple test patterns (rainbow, chase, solid colors)
+- Configurable FPS, LED count, and channels
+- Useful for testing and demonstrations
+
 ### `config/` - Configuration Specifications
 - JSON configuration format documentation
 - Example configuration files
 - Multi-output setup examples
 
-### `rust/` - Rust Implementation (Planned)
-High-performance production implementation
+### `opc-server-rs/` - Rust OPC Server (Planned)
+High-performance Rust implementation for production use
 
 ## Cross-Platform Support
 
@@ -107,16 +123,33 @@ This code has been tested extensively with the [HyperSerialPico](https://github.
 
 ## Installation
 
-### Python Version
+### Python OPC Server
+
+1. Install dependencies:
 ```bash
-cd python/
-# Installation instructions to be added
+cd opc-server-py/
+pip install -r requirements.txt
 ```
 
-### Rust Version
+2. Create a configuration file (see `config/config.example.json`)
+
+3. Run the server:
 ```bash
-cd rust/
-# Installation instructions to be added
+python opc_server.py config.json
+```
+
+4. Test with the shared test client:
+```bash
+cd ../opc-test
+python test_client.py --pattern rainbow --leds 100
+```
+
+See `opc-server-py/README.md` for detailed documentation.
+
+### Rust OPC Server (Coming Soon)
+```bash
+cd opc-server-rs/
+cargo run -- config.json
 ```
 
 ## Protocols
@@ -155,10 +188,10 @@ AWA (Advanced Wireless Addressable) is another serial protocol for LED control w
 
 ## Roadmap
 
-- [ ] Core OPC server implementation (Python)
+- [x] Core OPC server implementation (Python)
 - [ ] Core OPC server implementation (Rust)
-- [ ] AdaLight protocol output
-- [ ] AWA protocol output
+- [x] AdaLight protocol output
+- [x] AWA protocol output
 - [ ] Multi-port management
 - [ ] Command-line interface
 - [ ] Cross-platform testing (Windows, macOS, Linux)

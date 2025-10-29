@@ -72,27 +72,50 @@ class LEDOutput:
     
     def _transform_pixels(self, pixels: List[Tuple[int, int, int]]) -> List[Tuple]:
         """Transform RGB pixels based on pixel_format"""
-        transformed = []
+        # RGB passthrough - no transformation needed
+        if self.pixel_format == 'RGB' or self.pixel_format is None:
+            return pixels
         
-        for r, g, b in pixels:
-            if self.pixel_format == 'RGB':
-                transformed.append((r, g, b))
-            elif self.pixel_format == 'GRB':
-                transformed.append((g, r, b))
-            elif self.pixel_format == 'BGR':
-                transformed.append((b, g, r))
-            elif self.pixel_format == 'RGBW':
-                # Convert RGB to RGBW (white = min of RGB)
-                w = min(r, g, b)
-                transformed.append((r, g, b, w))
-            elif self.pixel_format == 'GRBW':
-                w = min(r, g, b)
-                transformed.append((g, r, b, w))
-            else:
-                # Default passthrough
-                transformed.append((r, g, b))
+        # For same-size 3-channel transforms, transform in place
+        if self.pixel_format in ('GRB', 'BGR'):
+            pixel_count = len(pixels)
+            # Pre-allocate list
+            transformed = [None] * pixel_count
+            
+            if self.pixel_format == 'GRB':
+                for i in range(pixel_count):
+                    r, g, b = pixels[i]
+                    transformed[i] = (g, r, b)
+            else:  # BGR
+                for i in range(pixel_count):
+                    r, g, b = pixels[i]
+                    transformed[i] = (b, g, r)
+            
+            return transformed
         
-        return transformed
+        # RGBW transforms - different size output
+        if self.pixel_format in ('RGBW', 'GRBW'):
+            pixel_count = len(pixels)
+            # Pre-allocate list for 4-channel output
+            transformed = [None] * pixel_count
+            
+            if self.pixel_format == 'RGBW':
+                for i in range(pixel_count):
+                    r, g, b = pixels[i]
+                    # Extract white channel and subtract from RGB
+                    w = min(r, g, b)
+                    transformed[i] = (r - w, g - w, b - w, w)
+            else:  # GRBW
+                for i in range(pixel_count):
+                    r, g, b = pixels[i]
+                    # Extract white channel and subtract from RGB
+                    w = min(r, g, b)
+                    transformed[i] = (g - w, r - w, b - w, w)
+            
+            return transformed
+        
+        # Unknown format - return unchanged
+        return pixels
     
     def _send_adalight_frame(self, pixels: List[Tuple]):
         """Send Adalight protocol frame"""

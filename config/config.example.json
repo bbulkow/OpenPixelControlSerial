@@ -9,6 +9,7 @@
       "port": "COM4",
       "protocol": "awa",
       "baud_rate": 2000000,
+      "opc_channel": 0,
       "led_count": 300,
       "opc_offset": 0,
       "pixel_format": "GRB"
