@@ -51,8 +51,13 @@ Shared test client for validating OPC servers:
 - Example configuration files
 - Multi-output setup examples
 
-### `opc-server-rs/` - Rust OPC Server (Planned)
-High-performance Rust implementation for production use
+### `opc-server-rs/` - Rust OPC Server
+High-performance Rust implementation for production use:
+- High-performance async I/O with Tokio
+- Zero-copy buffer management
+- True parallel serial port handling
+- Skip-ahead frame dropping
+- Same functionality as Python version with better performance
 
 ## Cross-Platform Support
 
@@ -189,16 +194,16 @@ AWA (Advanced Wireless Addressable) is another serial protocol for LED control w
 ## Roadmap
 
 - [x] Core OPC server implementation (Python)
-- [ ] Core OPC server implementation (Rust)
+- [x] Core OPC server implementation (Rust)
 - [x] AdaLight protocol output
 - [x] AWA protocol output
-- [ ] Multi-port management
-- [ ] Command-line interface
+- [x] Multi-port management
+- [x] Command-line interface
 - [ ] Cross-platform testing (Windows, macOS, Linux)
 - [ ] Raspberry Pi optimization
 - [ ] Systemd service files
 - [ ] Performance benchmarking
-- [ ] Documentation and examples
+- [x] Documentation and examples
 
 ## Contributing
 

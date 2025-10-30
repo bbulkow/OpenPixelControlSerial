@@ -376,7 +376,8 @@ def generate_config(discovered_devices: Dict[str, List[ProtocolDiscovery]]) -> D
                     "baud_rate": info.get('baud_rate', 115200),
                     "opc_channel": 0,  # Default to broadcast channel
                     "led_count": 100,  # Default, user should adjust
-                    "opc_offset": offset
+                    "opc_offset": offset,
+                    "pixel_format": "GRB"  # Most common format for addressable LEDs
                 }
                 
                 config['outputs'].append(output)

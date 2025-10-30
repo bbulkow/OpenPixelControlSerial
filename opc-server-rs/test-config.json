@@ -1,0 +1,17 @@
+{
+  "opc": {
+    "host": "0.0.0.0",
+    "port": 7891
+  },
+  "outputs": [
+    {
+      "port": "COM4",
+      "protocol": "awa",
+      "baud_rate": 2000000,
+      "opc_channel": 0,
+      "led_count": 100,
+      "opc_offset": 0,
+      "pixel_format": "GRB"
+    }
+  ]
+}
