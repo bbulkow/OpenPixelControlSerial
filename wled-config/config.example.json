@@ -1,0 +1,36 @@
+{
+  "opc": {
+    "host": "0.0.0.0",
+    "port": 7890
+  },
+  "outputs": [
+    {
+      "port": "COM4",
+      "protocol": "adalight",
+      "baud_rate": 2000000,
+      "opc_channel": 0,
+      "led_count": 300,
+      "opc_offset": 0,
+      "pixel_format": "GRB",
+      "device_name": "WLED Controller 1",
+      "device_type": "WLED",
+      "wled_version": "0.14.0",
+      "wled_brand": "ESP32",
+      "wled_product": "QuinLED-Dig-Uno",
+      "mac": "AA:BB:CC:DD:EE:FF"
+    },
+    {
+      "port": "COM5",
+      "protocol": "adalight",
+      "baud_rate": 115200,
+      "opc_channel": 0,
+      "led_count": 150,
+      "opc_offset": 300,
+      "pixel_format": "GRB",
+      "device_name": "WLED Controller 2",
+      "device_type": "WLED",
+      "wled_version": "0.14.1",
+      "mac": "11:22:33:44:55:66"
+    }
+  ]
+}
