@@ -152,6 +152,80 @@ class MyProtocolDiscovery(ProtocolDiscovery):
             return False
 ```
 
+## Protocol Implementation Notes
+
+### Improv Protocol
+
+The Improv WiFi provisioning protocol is used by WLED and other ESP32-based devices for device identification and WiFi configuration over serial. The protocol has some poorly documented details that are important to implement correctly.
+
+#### Packet Format (RPC Command)
+
+**Request Device Info Command (12 bytes):**
+```
+Byte 1-6:  "IMPROV" (0x49 0x4D 0x50 0x52 0x4F 0x56) - Header
+Byte 7:    0x01 - Version
+Byte 8:    0x03 - Type (RPC Command)
+Byte 9:    0x02 - Length (command byte + data length byte)
+Byte 10:   0x03 - Command (Request device information)
+Byte 11:   0x00 - Data length (0 for this command)
+Byte 12:   CHECKSUM - Sum of ALL bytes 1-11, mod 256
+```
+
+Example packet: `494d50524f560103020300e6`
+
+**CRITICAL IMPLEMENTATION DETAILS:**
+
+1. **Length field (Byte 9)**: Must be 0x02 (not 0x01), representing the command byte AND the data length byte, even when data length is 0
+2. **Checksum**: Includes the IMPROV header bytes (bytes 1-11 total)
+3. **Data length byte (Byte 11)**: Must be present even when 0x00
+
+#### Response Format (RPC Result)
+
+Devices may respond with multiple Improv packets. For example, WLED sends:
+1. An error/state packet (Type 0x02)
+2. The RPC result packet (Type 0x04) containing the actual data
+
+**RPC Result Packet Structure:**
+```
+Byte 1-6:  "IMPROV" header
+Byte 7:    Version
+Byte 8:    0x04 - Type (RPC Result)
+Byte 9:    Total packet length
+Byte 10:   Command echo (which command this is a response to)
+Byte 11:   Total data length (sum of all string lengths + their length bytes)
+Byte 12+:  Length-prefixed strings
+```
+
+**String Format:**
+Each string is prefixed with its length byte:
+```
+[length byte][string bytes][length byte][string bytes]...
+```
+
+For Request Device Info, the response contains 4 strings:
+1. Firmware name (e.g., "WLED")
+2. Firmware version (e.g., "0.15.0/2412100")
+3. Hardware (e.g., "esp32")
+4. Device name (e.g., "wled-2F8F70")
+
+#### Common Pitfalls
+
+1. **Missing data length byte**: Omitting byte 11 (even when 0x00) causes devices to reject the packet
+2. **Wrong length field**: Using 0x01 instead of 0x02 for the length field
+3. **Parsing offset errors**: Forgetting to account for command echo and total data length bytes in response
+4. **Single packet assumption**: Not handling multiple packets in the response buffer
+
+#### Reference Implementation
+
+See `ImprovDiscovery` class in `discover.py` for a working implementation.
+
+#### Official Documentation
+
+- Improv WiFi Spec: https://www.improv-wifi.com/serial/
+- WLED Implementation: https://github.com/Aircoookie/WLED
+
+**Note**: The official Improv spec does not clearly document all packet format details, particularly the checksum calculation and length field semantics. The implementation here is based on analysis of WLED's source code and empirical testing.
+
 ## Cross-Platform Compatibility
 
 This implementation uses `pyserial` which provides cross-platform serial port support:

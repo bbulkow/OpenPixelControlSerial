@@ -92,7 +92,7 @@ class AdaLightDiscovery(ProtocolDiscovery):
                         # Check for "Ada\n" pattern
                         if b'Ada\n' in buffer or b'Ada\r\n' in buffer:
                             if debug:
-                                print(f"    [DEBUG] ✓ Detected Adalight magic word!")
+                                print(f"    [DEBUG] [OK] Detected Adalight magic word!")
                             
                             self.device_info = {
                                 'protocol': 'adalight',
@@ -135,9 +135,13 @@ class WLEDDiscovery(ProtocolDiscovery):
             print(f"    [DEBUG] WLED JSON API only responds at 115200 baud")
         
         try:
-            with serial.Serial(self.port, 115200, timeout=0.5) as ser:
+            with serial.Serial(self.port, 115200, timeout=1.0) as ser:
                 if debug:
                     print(f"    [DEBUG] Port opened successfully")
+                
+                # Let port settle after opening
+                import time
+                time.sleep(0.1)
                 
                 # Clear buffers
                 ser.reset_input_buffer()
@@ -151,9 +155,8 @@ class WLEDDiscovery(ProtocolDiscovery):
                 ser.write(query)
                 ser.flush()
                 
-                # Wait for response (500ms total timeout for request-response)
-                import time
-                time.sleep(0.2)
+                # Wait longer for response - WLED can be slow to respond
+                time.sleep(0.5)
                 
                 # Quick check if any data is waiting
                 if ser.in_waiting == 0:
@@ -208,6 +211,12 @@ class WLEDDiscovery(ProtocolDiscovery):
                         print(f"    [DEBUG] Light capabilities: {lc} -> {pixel_format}")
                         print(f"    [DEBUG] Detected at baud rate: 115200")
                     
+                    # Check LIVE mode status - critical for serial LED data
+                    live_mode = info.get('live', False)
+                    
+                    if debug:
+                        print(f"    [DEBUG] LIVE mode: {live_mode}")
+                    
                     # Store device info including brand/product from JSON
                     self.device_info = {
                         'protocol': 'wled',
@@ -226,6 +235,7 @@ class WLEDDiscovery(ProtocolDiscovery):
                         'pixel_format': pixel_format,
                         'supported_protocols': ['adalight', 'tpm2'],
                         'mac': info.get('mac', ''),
+                        'live_mode': live_mode,
                         # WiFi info for display only
                         'wifi_ip': info.get('ip', ''),
                         'wifi_signal': wifi_info.get('signal', 0),
@@ -330,9 +340,13 @@ class ImprovDiscovery(ProtocolDiscovery):
             print(f"\n    [DEBUG] Starting Improv discovery on {self.port}")
         
         try:
-            with serial.Serial(self.port, 115200, timeout=0.5) as ser:
+            with serial.Serial(self.port, 115200, timeout=1.0) as ser:
                 if debug:
                     print(f"    [DEBUG] Port opened at 115200 baud")
+                
+                # Let port settle after opening
+                import time
+                time.sleep(0.1)
                 
                 # Clear buffers
                 ser.reset_input_buffer()
@@ -348,11 +362,10 @@ class ImprovDiscovery(ProtocolDiscovery):
                 ser.write(command_packet)
                 ser.flush()
                 
-                # Wait for response (500ms timeout for request-response)
-                import time
-                time.sleep(0.2)
+                # Wait longer for response - devices can be slow to respond
+                time.sleep(0.5)
                 
-                # Read response
+                # Read response (may contain multiple packets)
                 response = ser.read(256)
                 
                 if debug:
@@ -363,12 +376,12 @@ class ImprovDiscovery(ProtocolDiscovery):
                         print(f"    [DEBUG] Response too short")
                     return False
                 
-                # Parse Improv response
+                # Parse Improv response (may have multiple packets, look for RPC Result)
                 device_info = self._parse_improv_response(response, debug)
                 
                 if device_info:
                     if debug:
-                        print(f"    [DEBUG] ✓ Valid Improv device detected!")
+                        print(f"    [DEBUG] [OK] Valid Improv device detected!")
                         print(f"    [DEBUG] Firmware: {device_info.get('firmware_name')}")
                         print(f"    [DEBUG] Hardware: {device_info.get('hardware')}")
                     
@@ -390,14 +403,23 @@ class ImprovDiscovery(ProtocolDiscovery):
     
     def _build_device_info_request(self) -> bytes:
         """Build Improv RPC command to request device information"""
-        # Packet: 'IMPROV' + version(1) + type(0x03) + command(0x03) + length(0) + checksum
+        # Packet format (12 bytes total):
+        # Bytes 1-6: "IMPROV" header
+        # Byte 7: 0x01 (Version)
+        # Byte 8: 0x03 (Type = RPC Command)
+        # Byte 9: 0x02 (Length = 2 bytes: command + data_length)
+        # Byte 10: 0x03 (Command = Request device information)
+        # Byte 11: 0x00 (Data length = 0 for this command)
+        # Byte 12: Checksum (sum of ALL bytes 1-11, mod 256)
         packet = bytearray(b'IMPROV')
         packet.append(0x01)  # Version
         packet.append(0x03)  # Type: RPC Command
-        packet.append(0x00)  # Length: 0 (no data for device info request)
+        packet.append(0x02)  # Length: 2 bytes (command + data_length)
+        packet.append(0x03)  # Command: Request device info
+        packet.append(0x00)  # Data length: 0 bytes
         
-        # Calculate checksum (sum of all bytes after header, except checksum itself)
-        checksum = sum(packet[6:]) & 0xFF
+        # Calculate checksum (sum of ALL bytes including header, mod 256)
+        checksum = sum(packet) & 0xFF
         packet.append(checksum)
         
         return bytes(packet)
@@ -405,12 +427,21 @@ class ImprovDiscovery(ProtocolDiscovery):
     def _get_provisioning_state(self, ser, debug=False) -> str:
         """Request current provisioning state"""
         # Build state request command (0x02)
+        # Packet format (12 bytes total):
+        # Bytes 1-6: "IMPROV" header
+        # Byte 7: 0x01 (Version)
+        # Byte 8: 0x03 (Type = RPC Command)
+        # Byte 9: 0x02 (Length = 2 bytes: command + data_length)
+        # Byte 10: 0x02 (Command = Request current state)
+        # Byte 11: 0x00 (Data length = 0 for this command)
+        # Byte 12: Checksum (sum of ALL bytes 1-11, mod 256)
         packet = bytearray(b'IMPROV')
         packet.append(0x01)  # Version
         packet.append(0x03)  # Type: RPC Command
-        packet.append(0x01)  # Length: 1
+        packet.append(0x02)  # Length: 2 bytes (command + data_length)
         packet.append(0x02)  # Command: Request current state
-        checksum = sum(packet[6:]) & 0xFF
+        packet.append(0x00)  # Data length: 0 bytes
+        checksum = sum(packet) & 0xFF
         packet.append(checksum)
         
         ser.write(bytes(packet))
@@ -434,41 +465,70 @@ class ImprovDiscovery(ProtocolDiscovery):
         return 'Unknown'
     
     def _parse_improv_response(self, response: bytes, debug: bool = False) -> Optional[Dict[str, Any]]:
-        """Parse Improv RPC result packet"""
-        # Check header
-        if len(response) < 10 or response[:6] != b'IMPROV':
-            if debug:
-                print(f"    [DEBUG] Invalid Improv header")
-            return None
+        """Parse Improv RPC result packet (may contain multiple packets)"""
+        # Response may contain multiple Improv packets (e.g., error state + RPC result)
+        # Search through the response for an RPC Result packet (type 0x04)
         
-        version = response[6]
-        packet_type = response[7]
-        length = response[8]
+        offset = 0
+        while offset < len(response) - 10:
+            # Look for IMPROV header
+            if response[offset:offset+6] != b'IMPROV':
+                offset += 1
+                continue
+            
+            version = response[offset + 6]
+            packet_type = response[offset + 7]
+            length = response[offset + 8]
+            
+            if debug:
+                print(f"    [DEBUG] Packet at offset {offset}: Version: {version}, Type: {packet_type}, Length: {length}")
+            
+            # Check if this is an RPC Result packet (0x04)
+            if packet_type == 0x04:
+                # Parse this packet
+                packet_data = response[offset:]
+                return self._parse_rpc_result(packet_data, debug)
+            
+            # Skip to next potential packet
+            # Packet size = 6 (header) + 1 (ver) + 1 (type) + 1 (len) + length + 1 (checksum)
+            packet_size = 10 + length
+            offset += packet_size
         
         if debug:
-            print(f"    [DEBUG] Version: {version}, Type: {packet_type}, Length: {length}")
-        
-        # We expect RPC Result (0x04)
-        if packet_type != 0x04:
-            if debug:
-                print(f"    [DEBUG] Not an RPC result packet")
+            print(f"    [DEBUG] No RPC result packet found in response")
+        return None
+    
+    def _parse_rpc_result(self, packet_data: bytes, debug: bool = False) -> Optional[Dict[str, Any]]:
+        """Parse an RPC result packet (type 0x04)"""
+        if len(packet_data) < 12:
             return None
         
-        # Parse strings from data section
-        strings = []
-        offset = 9
+        # RPC Result format:
+        # Byte 9: Command that was executed (echo)
+        # Byte 10: Total length of string data
+        # Byte 11+: Length-prefixed strings
+        command_echo = packet_data[9]
+        total_data_length = packet_data[10]
         
-        while offset < len(response) - 1:  # -1 for checksum
-            if offset >= len(response):
+        if debug:
+            print(f"    [DEBUG] Command echo: 0x{command_echo:02x}")
+            print(f"    [DEBUG] Total data length: {total_data_length} bytes")
+        
+        # Parse strings from data section (starting after total length byte)
+        strings = []
+        offset = 11
+        
+        while offset < len(packet_data) - 1:  # -1 for checksum
+            if offset >= len(packet_data):
                 break
             
-            str_len = response[offset]
+            str_len = packet_data[offset]
             offset += 1
             
-            if str_len == 0 or offset + str_len > len(response):
+            if str_len == 0 or offset + str_len > len(packet_data):
                 break
             
-            string = response[offset:offset + str_len].decode('utf-8', errors='ignore')
+            string = packet_data[offset:offset + str_len].decode('utf-8', errors='ignore')
             strings.append(string)
             offset += str_len
         
@@ -585,12 +645,12 @@ class AWADiscovery(ProtocolDiscovery):
                                     print(f"    [DEBUG] USB Device: {port.description}")
                                     print(f"    [DEBUG] Hardware ID: {port.hwid}")
                                     if vid_pid_known:
-                                        print(f"    [DEBUG] ✓ Recognized as: {device_name}")
+                                        print(f"    [DEBUG] [OK] Recognized as: {device_name}")
                                 
                                 # If we found a known device that opened successfully at high baud rate
                                 if vid_pid_known and baud_rate >= 1000000:
                                     if debug:
-                                        print(f"    [DEBUG] ✓ AWA device detected by USB VID/PID at high baud rate!")
+                                        print(f"    [DEBUG] [OK] AWA device detected by USB VID/PID at high baud rate!")
                                     
                                     self.device_info = {
                                         'protocol': 'awa',
@@ -608,7 +668,7 @@ class AWADiscovery(ProtocolDiscovery):
                     # Regular Arduino/Adalight typically can't handle 2000000 baud reliably
                     if baud_rate >= 2000000:
                         if debug:
-                            print(f"    [DEBUG] ✓ Port accepts ultra-high baud rate (2Mbps) - likely AWA device")
+                            print(f"    [DEBUG] [OK] Port accepts ultra-high baud rate (2Mbps) - likely AWA device")
                         
                         self.device_info = {
                             'protocol': 'awa',
@@ -671,6 +731,10 @@ def discover_protocols(port: str, debug: bool = False) -> List[ProtocolDiscovery
         print(f"  Trying {discovery.get_protocol_name()}...")
         sys.stdout.flush()  # Ensure output appears immediately
         
+        # Add small delay between protocol checks to let device settle
+        import time
+        time.sleep(0.1)
+        
         # Skip Adalight magic word detection if WLED or AWA already detected
         skip_adalight = isinstance(discovery, AdaLightDiscovery) and (wled_detected or awa_detected)
         
@@ -683,7 +747,7 @@ def discover_protocols(port: str, debug: bool = False) -> List[ProtocolDiscovery
             result = discovery.discover()
         
         if result:
-            print("    → DETECTED")
+            print("    => DETECTED")
             detected.append(discovery)
             
             # Track what was detected
@@ -693,9 +757,9 @@ def discover_protocols(port: str, debug: bool = False) -> List[ProtocolDiscovery
                 awa_detected = True
         else:
             if skip_adalight:
-                print("    → SKIPPED (already detected via other protocol)")
+                print("    => SKIPPED (already detected via other protocol)")
             else:
-                print("    → NOT DETECTED")
+                print("    => NOT DETECTED")
     
     return detected
 
@@ -794,6 +858,18 @@ def main():
                     print(f"    Uptime: {wled_info.get('uptime', 0)} seconds")
                     
                     print(f"  " + "="*60)
+                    
+                    # Check and warn about LIVE mode status
+                    live_mode = info.get('live_mode', False)
+                    if not live_mode:
+                        print(f"\n  " + "!"*60)
+                        print(f"  [WARNING] LIVE MODE IS DISABLED!")
+                        print(f"  [WARNING] Serial LED data will NOT work until LIVE is enabled!")
+                        print(f"  [WARNING] Device will not respond to Adalight/AWA commands!")
+                        print(f"  !")
+                        print(f"  !  To enable LIVE mode, you need to configure the device.")
+                        print(f"  !  This is a read-only discovery tool.")
+                        print(f"  " + "!"*60)
                 
                 # Print standard info for all devices
                 print(f"\n  Configuration:")
@@ -816,10 +892,10 @@ def main():
         try:
             with open(config_path, 'w') as f:
                 json.dump(config, f, indent=2)
-            print(f"\n✓ Configuration saved to: {config_path}")
+            print(f"\n[OK] Configuration saved to: {config_path}")
             print(f"  Review and adjust LED counts and pixel formats as needed.")
         except Exception as e:
-            print(f"\n✗ Error writing config file: {e}")
+            print(f"\n[ERROR] Error writing config file: {e}")
             return 1
     else:
         print("\nNo LED controller devices detected.")
@@ -904,6 +980,11 @@ def generate_config(discovered_devices: Dict[str, List[ProtocolDiscovery]]) -> D
                     "wled_product": info.get('product', ''),
                     "note": protocol_note
                 }
+                
+                # Mark as disabled if LIVE mode is off
+                if not info.get('live_mode', False):
+                    output['disabled'] = True
+                    output['disabled_reason'] = 'WLED LIVE mode is disabled - enable via web interface'
                 
                 # Add WiFi info if available
                 if info.get('wifi_ip'):
