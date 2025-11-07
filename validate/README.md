@@ -122,7 +122,27 @@ python validate.py --pattern hue-circle --duration 60
 2. Verify LED strip is powered (most strips need external 5V power)
 3. Check serial port path is correct in config.json
 4. Verify baud rate matches your device
-5. Try a simple white-blink test first
+5. **For WLED devices**: Ensure LIVE mode is enabled (see below)
+6. Try a simple white-blink test first
+
+### WLED Devices Not Responding
+
+WLED devices ship with LIVE mode **disabled** by default. When LIVE mode is disabled, the device runs internal effects/patterns and **ignores serial LED data** from this validation tool.
+
+**Solution**: Use the WLED Configuration Tool to enable LIVE mode:
+
+```bash
+cd ../wled-config
+python wled_config.py --enable-live
+```
+
+For more information, see the [WLED Configuration Tool documentation](../wled-config/README.md).
+
+**How to check**: Run the discovery tool to see LIVE mode status:
+```bash
+cd ../discover
+python discover.py
+```
 
 ### Wrong colors appear
 

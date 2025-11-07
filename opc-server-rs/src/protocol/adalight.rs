@@ -3,8 +3,10 @@ pub fn build_adalight_frame(pixel_data: &[u8], stride: usize) -> Vec<u8> {
     let led_count = pixel_data.len() / stride;
     
     // Adalight header: 'Ada' + LED count high + LED count low + checksum
-    let count_hi = (led_count >> 8) as u8 & 0xFF;
-    let count_lo = led_count as u8 & 0xFF;
+    // CRITICAL: LED count field is (actual_count - 1), matching AWA protocol convention
+    let count_minus_one = led_count.saturating_sub(1);
+    let count_hi = (count_minus_one >> 8) as u8 & 0xFF;
+    let count_lo = count_minus_one as u8 & 0xFF;
     let checksum = count_hi ^ count_lo ^ 0x55;
     
     let mut frame = Vec::with_capacity(6 + pixel_data.len());

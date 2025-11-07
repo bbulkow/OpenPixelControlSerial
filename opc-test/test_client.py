@@ -93,6 +93,27 @@ def pattern_chase(led_count, position, length, r, g, b):
     return pixels
 
 
+def pattern_discover_match(led_count, frame):
+    """
+    EXACT pattern that discover.py sends
+    Matches discover.py's generate_test_pattern() function
+    Pattern: White → Off → Red → Off → Blue → Off → Green → Off
+    """
+    patterns = [
+        (255, 255, 255),  # White
+        (0, 0, 0),        # Off
+        (255, 0, 0),      # Red
+        (0, 0, 0),        # Off
+        (0, 0, 255),      # Blue
+        (0, 0, 0),        # Off
+        (0, 255, 0),      # Green
+        (0, 0, 0),        # Off
+    ]
+    
+    color = patterns[frame % len(patterns)]
+    return [color] * led_count
+
+
 def main():
     parser = argparse.ArgumentParser(description='OPC Test Client - Send test patterns to OPC server')
     parser.add_argument('--host', default='localhost', help='OPC server host (default: localhost)')
@@ -100,7 +121,7 @@ def main():
     parser.add_argument('--channel', type=int, default=0, help='OPC channel (default: 0)')
     parser.add_argument('--leds', type=int, default=100, help='Number of LEDs (default: 100)')
     parser.add_argument('--pattern', default='rainbow', 
-                       choices=['solid', 'rainbow', 'chase', 'red', 'green', 'blue', 'white'],
+                       choices=['solid', 'rainbow', 'chase', 'red', 'green', 'blue', 'white', 'discover'],
                        help='Test pattern (default: rainbow)')
     parser.add_argument('--duration', type=float, default=10.0, help='Duration in seconds (default: 10)')
     parser.add_argument('--fps', type=int, default=30, help='Frames per second (default: 30)')
@@ -145,6 +166,8 @@ def main():
                 pixels = pattern_solid(args.leds, 0, 0, 255)
             elif args.pattern == 'white':
                 pixels = pattern_solid(args.leds, 255, 255, 255)
+            elif args.pattern == 'discover':
+                pixels = pattern_discover_match(args.leds, frame)
             elif args.pattern == 'rainbow':
                 offset = (frame * 0.01) % 1.0
                 pixels = pattern_rainbow(args.leds, offset)

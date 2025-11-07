@@ -9,690 +9,553 @@ import json
 import os
 import serial
 import serial.tools.list_ports
+import time
 from abc import ABC, abstractmethod
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 
-class ProtocolDiscovery(ABC):
-    """Base class for protocol-specific device discovery"""
+# ============================================================================
+# Protocol Frame Builders (extracted from validate.py)
+# ============================================================================
+
+def build_adalight_frame(pixels: List[Tuple[int, int, int]]) -> bytes:
+    """
+    Build Adalight protocol frame
+    Header: 'Ada' + LED count high + LED count low + checksum + pixel data
+    NOTE: LED count field is (actual_count - 1), matching AWA protocol convention
+    """
+    led_count = len(pixels)
+    count_minus_one = led_count - 1
+    header = bytearray([
+        0x41, 0x64, 0x61,  # 'Ada'
+        (count_minus_one >> 8) & 0xFF,
+        count_minus_one & 0xFF,
+        (count_minus_one >> 8) ^ (count_minus_one & 0xFF) ^ 0x55
+    ])
+    
+    # Build pixel data (RGB)
+    data = bytearray()
+    for r, g, b in pixels:
+        data.append(r & 0xFF)
+        data.append(g & 0xFF)
+        data.append(b & 0xFF)
+    
+    return bytes(header + data)
+
+
+def build_awa_frame(pixels: List[Tuple[int, int, int]]) -> bytes:
+    """
+    Build AWA protocol frame (HyperSerialPico format)
+    Header: 'Awa' + LED count high + LED count low + CRC + pixel data + Fletcher checksums
+    """
+    led_count = len(pixels)
+    
+    # AWA header
+    count_hi = (led_count - 1) >> 8 & 0xFF
+    count_lo = (led_count - 1) & 0xFF
+    crc = (count_hi ^ count_lo) ^ 0x55
+    
+    header = bytearray([
+        0x41, 0x77, 0x61,  # 'Awa'
+        count_hi,
+        count_lo,
+        crc
+    ])
+    
+    # Build pixel data (RGB)
+    data = bytearray()
+    for r, g, b in pixels:
+        data.append(r & 0xFF)
+        data.append(g & 0xFF)
+        data.append(b & 0xFF)
+    
+    # Calculate Fletcher checksums
+    fletcher1 = 0
+    fletcher2 = 0
+    fletcher_ext = 0
+    position = 0
+    
+    for byte in data:
+        fletcher1 = (fletcher1 + byte) % 255
+        fletcher2 = (fletcher2 + fletcher1) % 255
+        fletcher_ext = (fletcher_ext + (byte ^ position)) % 255
+        position += 1
+    
+    # Special case: if fletcher_ext is 0x41 ('A'), use 0xaa
+    if fletcher_ext == 0x41:
+        fletcher_ext = 0xaa
+    
+    return bytes(header + data + bytearray([fletcher1, fletcher2, fletcher_ext]))
+
+
+# ============================================================================
+# Test Pattern Generator
+# ============================================================================
+
+def generate_test_pattern(frame: int, led_count: int = 10) -> List[Tuple[int, int, int]]:
+    """
+    Generate test pattern: White → Off → Red → Off → Blue → Off → Green → Off
+    Pattern cycles every 8 frames (at 0.5s interval = 4 seconds per cycle)
+    """
+    patterns = [
+        (255, 255, 255),  # White
+        (0, 0, 0),        # Off
+        (255, 0, 0),      # Red
+        (0, 0, 0),        # Off
+        (0, 0, 255),      # Blue
+        (0, 0, 0),        # Off
+        (0, 255, 0),      # Green
+        (0, 0, 0),        # Off
+    ]
+    
+    color = patterns[frame % len(patterns)]
+    return [color] * led_count
+
+
+# ============================================================================
+# User Interaction Helpers
+# ============================================================================
+
+def ask_user(question: str) -> bool:
+    """Ask user a yes/no question, return True for yes, False for no"""
+    while True:
+        try:
+            response = input(f"{question} (y/n): ").strip().lower()
+            if response in ('y', 'yes'):
+                return True
+            elif response in ('n', 'no'):
+                return False
+            else:
+                print("  Please enter 'y' or 'n'")
+        except (KeyboardInterrupt, EOFError):
+            print("\n  Interrupted by user")
+            return False
+
+
+def wait_for_confirmation(question: str) -> bool:
+    """Wait for user to confirm they see the pattern (no timeout)"""
+    return ask_user(question)
+
+
+# ============================================================================
+# Interactive Protocol Testing
+# ============================================================================
+
+def test_protocol_interactive(port: str, baud_rate: int, protocol: str, 
+                              led_count: int = 10, debug: bool = False) -> bool:
+    """
+    Test a protocol interactively by sending visual pattern
+    Returns True if user confirms LEDs are blinking
+    """
+    import threading
+    
+    try:
+        if debug:
+            print(f"    [DEBUG] Opening {port} at {baud_rate} baud for {protocol} test")
+        
+        with serial.Serial(port, baud_rate, timeout=1) as ser:
+            # Allow device to initialize
+            time.sleep(0.1)
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            
+            print(f"    Testing {baud_rate} baud - Watch your LEDs!")
+            print(f"    Pattern: White → Off → Red → Off → Blue → Off → Green → Off")
+            
+            # Flag to control pattern loop
+            keep_running = threading.Event()
+            keep_running.set()
+            
+            # Function to send pattern in background
+            def send_pattern():
+                frame = 0
+                last_frame_time = None
+                try:
+                    while keep_running.is_set():
+                        current_time = time.time()
+                        if last_frame_time is not None:
+                            frame_delay = current_time - last_frame_time
+                        else:
+                            frame_delay = 0
+                        last_frame_time = current_time
+                        
+                        pixels = generate_test_pattern(frame, led_count)
+                        
+                        if protocol == 'awa':
+                            frame_data = build_awa_frame(pixels)
+                        elif protocol == 'adalight':
+                            frame_data = build_adalight_frame(pixels)
+                        else:
+                            return
+                        
+                        if debug:
+                            from datetime import datetime
+                            ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                            print(f"[{ts}] [DISCOVER-TIMING] Frame #{frame}: delay={frame_delay*1000:.1f}ms since last")
+                            print(f"[{ts}] [DISCOVER-DATA] {protocol.upper()}: {len(frame_data)} bytes total")
+                            if protocol == 'adalight':
+                                print(f"[{ts}] [DISCOVER-DATA]   - Header: 6 bytes")
+                                print(f"[{ts}] [DISCOVER-DATA]   - Pixel data: {len(frame_data)-6} bytes")
+                                print(f"[{ts}] [DISCOVER-DATA]   - LED count: {led_count}")
+                            hex_dump = ' '.join(f'{b:02x}' for b in frame_data[:48])
+                            print(f"[{ts}] [DISCOVER-HEX] First 48 bytes: {hex_dump}")
+                        
+                        ser.write(frame_data)
+                        ser.flush()
+                        
+                        time.sleep(0.5)  # 0.5s per frame
+                        frame += 1
+                except:
+                    pass  # Ignore errors when stopping
+            
+            # Start pattern in background thread
+            pattern_thread = threading.Thread(target=send_pattern, daemon=True)
+            pattern_thread.start()
+            
+            # Give pattern a moment to start
+            time.sleep(0.5)
+            
+            try:
+                # Ask user immediately while pattern plays
+                result = wait_for_confirmation("    Did you see LEDs blinking in this pattern?")
+                
+                # Stop pattern
+                keep_running.clear()
+                pattern_thread.join(timeout=1.0)
+                
+                # Clear LEDs after test
+                clear_pixels = [(0, 0, 0)] * led_count
+                if protocol == 'awa':
+                    ser.write(build_awa_frame(clear_pixels))
+                else:
+                    ser.write(build_adalight_frame(clear_pixels))
+                ser.flush()
+                
+                return result
+                
+            except KeyboardInterrupt:
+                print("\n    Test interrupted")
+                keep_running.clear()
+                return False
+                
+    except (serial.SerialException, OSError) as e:
+        if debug:
+            print(f"    [DEBUG] Error during test: {e}")
+        return False
+
+
+# ============================================================================
+# WLED Discovery with Interactive LED Speed Testing
+# ============================================================================
+
+class WLEDDiscovery:
+    """WLED discovery with JSON API and interactive LED data speed testing"""
     
     def __init__(self, port: str):
         self.port = port
         self.device_info: Dict[str, Any] = {}
     
-    @abstractmethod
-    def discover(self) -> bool:
+    def discover(self, debug: bool = False) -> Optional[Dict[str, Any]]:
         """
-        Attempt to discover if this port speaks this protocol
-        Returns True if device is detected, False otherwise
+        Discover WLED device:
+        1. Scan for JSON API baud rate (handshake speed)
+        2. Extract device info
+        3. Test LED data speeds interactively (starting at handshake speed, going up)
         """
-        pass
-    
-    @abstractmethod
-    def get_protocol_name(self) -> str:
-        """Return the name of this protocol"""
-        pass
-    
-    def get_device_info(self) -> Dict[str, Any]:
-        """Return discovered device information"""
-        return self.device_info
-
-
-class AdaLightDiscovery(ProtocolDiscovery):
-    """
-    AdaLight protocol discovery via "magic word"
-    
-    Traditional Adalight devices periodically transmit "Ada\n" (every 1-5 seconds)
-    when idle as a discovery/keepalive signal.
-    """
-    
-    def get_protocol_name(self) -> str:
-        return "AdaLight"
-    
-    def discover(self, debug=False, skip=False) -> bool:
-        """
-        Listen for periodic 'Ada\n' magic word that traditional Adalight devices send
+        print(f"  Testing WLED...")
         
-        Args:
-            debug: Enable debug output
-            skip: If True, skip detection (used when WLED or AWA already detected)
-        """
-        if skip:
+        # Step 1: Find JSON API
+        json_api_baud = self._scan_for_json_api(debug)
+        if not json_api_baud:
+            print(f"    ✗ No WLED JSON API found")
+            return None
+        
+        print(f"    ✓ Found WLED JSON API at {json_api_baud} baud")
+        
+        # Step 2: Get device info
+        device_info = self._get_device_info(json_api_baud, debug)
+        if not device_info:
+            print(f"    ✗ Could not retrieve device info")
+            return None
+        
+        print(f"    ✓ Device: {device_info.get('name', 'WLED')} v{device_info.get('version', '?')}")
+        print(f"    ✓ LEDs: {device_info.get('led_count', '?')}")
+        
+        # Step 3: Test LED data speeds interactively
+        print(f"\n    Now testing LED data speeds (Adalight protocol)...")
+        print(f"    Starting at {json_api_baud} baud and testing higher speeds...")
+        
+        best_speed = self._test_led_data_speeds(json_api_baud, debug)
+        
+        print(f"    ✓ Best LED data speed: {best_speed} baud")
+        
+        # Build final device info
+        device_info['protocol'] = 'adalight'
+        device_info['hardware_type'] = 'WLED'
+        device_info['handshake_baud_rate'] = json_api_baud
+        device_info['baud_rate'] = best_speed
+        
+        return device_info
+    
+    def _scan_for_json_api(self, debug: bool = False) -> Optional[int]:
+        """Scan for WLED JSON API baud rate"""
+        test_rates = [115200, 230400, 460800, 500000, 576000, 921600, 1000000]
+        
+        for baud_rate in test_rates:
             if debug:
-                print(f"\n    [DEBUG] Skipping Adalight magic word detection (already detected via other protocol)")
-            return False
-        
-        if debug:
-            print(f"\n    [DEBUG] Starting Adalight magic word discovery on {self.port}")
-            print(f"    [DEBUG] Listening for 'Ada\\n' keepalive signal (waiting up to 5 seconds)")
-        
-        try:
-            with serial.Serial(self.port, 115200, timeout=6) as ser:
-                if debug:
-                    print(f"    [DEBUG] Port opened at 115200 baud")
-                
-                # Clear buffers
-                ser.reset_input_buffer()
-                ser.reset_output_buffer()
-                
-                # Listen for "Ada\n" magic word
-                # Traditional Adalight sends this every 1-5 seconds when idle
-                import time
-                start_time = time.time()
-                buffer = b''
-                
-                while time.time() - start_time < 5.5:
-                    if ser.in_waiting > 0:
-                        data = ser.read(ser.in_waiting)
-                        buffer += data
-                        
-                        if debug and data:
-                            print(f"    [DEBUG] Received: {data}")
-                        
-                        # Check for "Ada\n" pattern
-                        if b'Ada\n' in buffer or b'Ada\r\n' in buffer:
-                            if debug:
-                                print(f"    [DEBUG] [OK] Detected Adalight magic word!")
-                            
-                            self.device_info = {
-                                'protocol': 'adalight',
-                                'detected_by': 'magic_word',
-                                'baud_rate': 115200,
-                                'note': 'Detected via Ada\\n keepalive signal'
-                            }
-                            return True
-                    
+                print(f"    [DEBUG] Testing JSON API at {baud_rate} baud")
+            
+            try:
+                with serial.Serial(self.port, baud_rate, timeout=1.0) as ser:
                     time.sleep(0.1)
-                
-                if debug:
-                    print(f"    [DEBUG] No Adalight magic word detected after 5 seconds")
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
                     
-        except (serial.SerialException, OSError) as e:
-            if debug:
-                print(f"    [DEBUG] Error: {e}")
+                    query = b'{"v":true}\n'
+                    ser.write(query)
+                    ser.flush()
+                    time.sleep(0.5)
+                    
+                    if ser.in_waiting > 0:
+                        response = ser.read(ser.in_waiting)
+                        try:
+                            response_str = response.decode('utf-8', errors='ignore')
+                            data = json.loads(response_str)
+                            if 'info' in data and 'state' in data:
+                                return baud_rate
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            continue
+            except (serial.SerialException, OSError):
+                continue
         
-        return False
-
-
-class WLEDDiscovery(ProtocolDiscovery):
-    """
-    WLED over serial discovery
-    WLED devices respond to JSON API commands over serial
-    """
+        return None
     
-    def get_protocol_name(self) -> str:
-        return "WLED"
-    
-    def discover(self, debug=False) -> bool:
-        """
-        Try to query WLED device via JSON API over serial
-        WLED JSON API only works at 115200 baud
-        Note: WLED's Adalight protocol for LED data may work at higher speeds,
-        but this cannot be detected via JSON API
-        """
-        if debug:
-            print(f"\n    [DEBUG] Starting WLED discovery on {self.port}")
-            print(f"    [DEBUG] WLED JSON API only responds at 115200 baud")
-        
+    def _get_device_info(self, baud_rate: int, debug: bool = False) -> Optional[Dict[str, Any]]:
+        """Get WLED device information via JSON API"""
         try:
-            with serial.Serial(self.port, 115200, timeout=1.0) as ser:
-                if debug:
-                    print(f"    [DEBUG] Port opened successfully")
-                
-                # Let port settle after opening
-                import time
+            with serial.Serial(self.port, baud_rate, timeout=1.0) as ser:
                 time.sleep(0.1)
-                
-                # Clear buffers
                 ser.reset_input_buffer()
                 ser.reset_output_buffer()
                 
-                # Send JSON API query for state and info
                 query = b'{"v":true}\n'
-                if debug:
-                    print(f"    [DEBUG] Sending: {query.decode().strip()}")
-                
                 ser.write(query)
                 ser.flush()
-                
-                # Wait longer for response - WLED can be slow to respond
                 time.sleep(0.5)
                 
-                # Quick check if any data is waiting
-                if ser.in_waiting == 0:
-                    if debug:
-                        print(f"    [DEBUG] No response from WLED JSON API")
-                    return False
-                
-                # Read response
-                response = b''
-                while ser.in_waiting > 0:
-                    chunk = ser.read(ser.in_waiting)
-                    response += chunk
-                    time.sleep(0.02)
-                
-                if debug:
-                    print(f"    [DEBUG] Received {len(response)} bytes")
+                response = ser.read(ser.in_waiting) if ser.in_waiting > 0 else b''
                 
                 if not response:
-                    if debug:
-                        print(f"    [DEBUG] No data after reading")
-                    return False
+                    return None
                 
-                # Try to parse as JSON
-                try:
-                    response_str = response.decode('utf-8', errors='ignore')
-                    if debug:
-                        print(f"    [DEBUG] Full JSON Response from WLED:")
-                        print(f"    [DEBUG] {response_str}")
-                    
-                    import json
-                    data = json.loads(response_str)
-                    
-                    # Validate it's a WLED response
-                    if 'info' not in data or 'state' not in data:
-                        if debug:
-                            print(f"    [DEBUG] Invalid WLED response structure")
-                        return False
-                    
-                    # Extract device information
-                    info = data.get('info', {})
-                    leds_info = info.get('leds', {})
-                    wifi_info = info.get('wifi', {})
-                    
-                    # Parse light capabilities
-                    lc = leds_info.get('lc', 1)
-                    pixel_format = self._parse_pixel_format(lc, debug)
-                    
-                    if debug:
-                        print(f"    [DEBUG] VALID WLED DEVICE DETECTED!")
-                        print(f"    [DEBUG] Version: {info.get('ver')}")
-                        print(f"    [DEBUG] LED count: {leds_info.get('count')}")
-                        print(f"    [DEBUG] Light capabilities: {lc} -> {pixel_format}")
-                        print(f"    [DEBUG] Detected at baud rate: 115200")
-                    
-                    # Check LIVE mode status - critical for serial LED data
-                    live_mode = info.get('live', False)
-                    
-                    if debug:
-                        print(f"    [DEBUG] LIVE mode: {live_mode}")
-                    
-                    # Store device info including brand/product from JSON
-                    self.device_info = {
-                        'protocol': 'wled',
-                        'detected_by': 'json_api',
-                        'baud_rate': 115200,
-                        'version': info.get('ver', 'unknown'),
-                        'name': info.get('name', 'WLED Device'),
-                        'brand': info.get('brand', ''),
-                        'product': info.get('product', ''),
-                        'led_count': leds_info.get('count', 100),
-                        'capabilities': {
-                            'rgb': bool(lc & 0x01),
-                            'white': bool(lc & 0x02),
-                            'cct': bool(lc & 0x04)
-                        },
-                        'pixel_format': pixel_format,
-                        'supported_protocols': ['adalight', 'tpm2'],
-                        'mac': info.get('mac', ''),
-                        'live_mode': live_mode,
-                        # WiFi info for display only
-                        'wifi_ip': info.get('ip', ''),
-                        'wifi_signal': wifi_info.get('signal', 0),
-                        'wifi_bssid': wifi_info.get('bssid', ''),
-                        'wifi_channel': wifi_info.get('channel', 0),
-                        # Store full JSON for user reference
-                        'full_json': data
-                    }
-                    return True
-                    
-                except json.JSONDecodeError as e:
-                    if debug:
-                        print(f"    [DEBUG] JSON decode error: {e}")
-                    return False
-                    
-        except (serial.SerialException, OSError) as e:
+                response_str = response.decode('utf-8', errors='ignore')
+                data = json.loads(response_str)
+                
+                info = data.get('info', {})
+                leds_info = info.get('leds', {})
+                
+                # Parse light capabilities for pixel format
+                lc = leds_info.get('lc', 1)
+                pixel_format = self._parse_pixel_format(lc)
+                
+                return {
+                    'name': info.get('name', 'WLED Device'),
+                    'version': info.get('ver', 'unknown'),
+                    'brand': info.get('brand', ''),
+                    'product': info.get('product', ''),
+                    'led_count': leds_info.get('count', 100),
+                    'pixel_format': pixel_format,
+                    'mac': info.get('mac', ''),
+                    'arch': info.get('arch', ''),
+                }
+        except Exception as e:
             if debug:
-                print(f"    [DEBUG] Error opening port: {e}")
-            return False
-        
-        # Fallback: Try version query command (byte 0x76)
-        if debug:
-            print(f"    [DEBUG] JSON API failed, trying version query fallback")
-        
-        try:
-            with serial.Serial(self.port, 115200, timeout=2) as ser:
-                ser.reset_input_buffer()
-                ser.reset_output_buffer()
-                
-                # Send version query
-                ser.write(b'v')
-                ser.flush()
-                
-                import time
-                time.sleep(0.2)
-                
-                response = ser.read(100)
-                if response and len(response) > 0:
-                    response_str = response.decode('utf-8', errors='ignore').strip()
-                    if debug:
-                        print(f"    [DEBUG] Version response: {response_str}")
-                    
-                    # Store minimal info
-                    self.device_info = {
-                        'protocol': 'wled',
-                        'detected_by': 'version_query',
-                        'baud_rate': 115200,
-                        'version': response_str,
-                        'name': 'WLED Device',
-                        'led_count': 100,  # Default
-                        'pixel_format': 'GRB',
-                        'supported_protocols': ['adalight', 'tpm2'],
-                        'note': 'Limited info - JSON API failed'
-                    }
-                    return True
-        except:
-            pass
-        
-        if debug:
-            print(f"    [DEBUG] No WLED device detected")
-        return False
+                print(f"    [DEBUG] Error getting device info: {e}")
+            return None
     
-    def _parse_pixel_format(self, lc: int, debug: bool = False) -> str:
-        """
-        Parse light capabilities byte to determine pixel format
-        lc bit 0: RGB support
-        lc bit 1: White channel support
-        lc bit 2: CCT support
-        """
+    def _parse_pixel_format(self, lc: int) -> str:
+        """Parse light capabilities byte to pixel format"""
         has_rgb = bool(lc & 0x01)
         has_white = bool(lc & 0x02)
         
         if has_rgb and has_white:
-            # RGBW - most common order is GRBW for addressable LEDs
             return 'GRBW'
         elif has_rgb:
-            # RGB - most common order is GRB for addressable LEDs like WS2812B
             return 'GRB'
-        elif has_white:
-            # White only
-            return 'W'
         else:
-            # Default
-            return 'GRB'
-
-
-class ImprovDiscovery(ProtocolDiscovery):
-    """
-    Improv WiFi provisioning protocol discovery
-    A standardized protocol for device identification over serial
-    """
+            return 'GRB'  # Default
     
-    def get_protocol_name(self) -> str:
-        return "Improv"
+    def _test_led_data_speeds(self, start_baud: int, debug: bool = False) -> int:
+        """
+        Test LED data speeds interactively starting at start_baud and going up
+        Uses WLED baud change command to switch speeds
+        Returns the highest working baud rate
+        """
+        # Baud rate to command byte mapping
+        baud_commands = {
+            115200: 0xB0,
+            230400: 0xB1,
+            460800: 0xB2,
+            500000: 0xB3,
+            576000: 0xB4,
+            921600: 0xB5,
+            1000000: 0xB6,
+            1500000: 0xB7,
+            2000000: 0xB8
+        }
+        
+        # Test speeds starting at handshake speed and going up
+        all_speeds = [115200, 230400, 460800, 500000, 576000, 921600, 1000000, 1500000, 2000000]
+        test_speeds = [s for s in all_speeds if s >= start_baud]
+        
+        best_speed = start_baud
+        
+        for speed in test_speeds:
+            # Send baud change command if not at start baud
+            if speed != start_baud:
+                if not self._change_wled_baud(best_speed, speed, baud_commands, debug):
+                    print(f"    ✗ Failed to switch WLED to {speed} baud")
+                    break
+            
+            # Test Adalight at this speed
+            result = test_protocol_interactive(self.port, speed, 'adalight', led_count=10, debug=debug)
+            
+            if result:
+                print(f"    ✓ {speed} baud works")
+                best_speed = speed
+            else:
+                print(f"    ✗ {speed} baud failed")
+                break  # Stop at first failure
+        
+        return best_speed
     
-    def discover(self, debug=False) -> bool:
+    def _change_wled_baud(self, current_baud: int, target_baud: int, 
+                          baud_commands: dict, debug: bool = False) -> bool:
         """
-        Try to detect Improv-capable device
-        Improv requires 115200 baud (fixed)
+        Send WLED baud change command and verify
+        Returns True if successful
         """
-        if debug:
-            print(f"\n    [DEBUG] Starting Improv discovery on {self.port}")
+        if target_baud not in baud_commands:
+            if debug:
+                print(f"    [DEBUG] No baud command for {target_baud}")
+            return False
         
         try:
-            with serial.Serial(self.port, 115200, timeout=1.0) as ser:
-                if debug:
-                    print(f"    [DEBUG] Port opened at 115200 baud")
-                
-                # Let port settle after opening
-                import time
+            if debug:
+                print(f"    [DEBUG] Sending baud change command: {current_baud} -> {target_baud}")
+            
+            # Open at current baud rate
+            with serial.Serial(self.port, current_baud, timeout=1.0) as ser:
                 time.sleep(0.1)
-                
-                # Clear buffers
                 ser.reset_input_buffer()
                 ser.reset_output_buffer()
                 
-                # Build RPC Command: Request Device Information (0x03)
-                # Packet format: 'IMPROV' + version + type + command + length + data + checksum
-                command_packet = self._build_device_info_request()
-                
+                # Send single byte baud change command
+                command_byte = bytes([baud_commands[target_baud]])
                 if debug:
-                    print(f"    [DEBUG] Sending device info request: {command_packet.hex()}")
+                    print(f"    [DEBUG] Sending byte: 0x{baud_commands[target_baud]:02X}")
                 
-                ser.write(command_packet)
+                ser.write(command_byte)
                 ser.flush()
                 
-                # Wait longer for response - devices can be slow to respond
-                time.sleep(0.5)
+                # Wait for response: "Baud is now XXXXX\n"
+                time.sleep(0.2)
                 
-                # Read response (may contain multiple packets)
-                response = ser.read(256)
+                if ser.in_waiting > 0:
+                    response = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+                    if debug:
+                        print(f"    [DEBUG] Response: {response.strip()}")
+                    
+                    # Check if response confirms baud change
+                    if f"Baud is now {target_baud}" in response or f"{target_baud}" in response:
+                        if debug:
+                            print(f"    [DEBUG] Baud change confirmed")
+                        return True
                 
+                # Even without confirmation, try proceeding (response may be missed)
                 if debug:
-                    print(f"    [DEBUG] Received {len(response)} bytes: {response.hex()}")
-                
-                if len(response) < 10:
-                    if debug:
-                        print(f"    [DEBUG] Response too short")
-                    return False
-                
-                # Parse Improv response (may have multiple packets, look for RPC Result)
-                device_info = self._parse_improv_response(response, debug)
-                
-                if device_info:
-                    if debug:
-                        print(f"    [DEBUG] [OK] Valid Improv device detected!")
-                        print(f"    [DEBUG] Firmware: {device_info.get('firmware_name')}")
-                        print(f"    [DEBUG] Hardware: {device_info.get('hardware')}")
-                    
-                    # Also get current state
-                    state = self._get_provisioning_state(ser, debug)
-                    if state:
-                        device_info['provisioning_state'] = state
-                    
-                    self.device_info = device_info
-                    return True
+                    print(f"    [DEBUG] No confirmation, but proceeding anyway")
+                return True
                 
         except (serial.SerialException, OSError) as e:
             if debug:
-                print(f"    [DEBUG] Error: {e}")
-        
-        if debug:
-            print(f"    [DEBUG] No Improv device detected")
-        return False
+                print(f"    [DEBUG] Error changing baud: {e}")
+            return False
+
+
+# ============================================================================
+# AWA Interactive Discovery
+# ============================================================================
+
+class AWADiscovery:
+    """AWA protocol discovery with interactive visual confirmation"""
     
-    def _build_device_info_request(self) -> bytes:
-        """Build Improv RPC command to request device information"""
-        # Packet format (12 bytes total):
-        # Bytes 1-6: "IMPROV" header
-        # Byte 7: 0x01 (Version)
-        # Byte 8: 0x03 (Type = RPC Command)
-        # Byte 9: 0x02 (Length = 2 bytes: command + data_length)
-        # Byte 10: 0x03 (Command = Request device information)
-        # Byte 11: 0x00 (Data length = 0 for this command)
-        # Byte 12: Checksum (sum of ALL bytes 1-11, mod 256)
-        packet = bytearray(b'IMPROV')
-        packet.append(0x01)  # Version
-        packet.append(0x03)  # Type: RPC Command
-        packet.append(0x02)  # Length: 2 bytes (command + data_length)
-        packet.append(0x03)  # Command: Request device info
-        packet.append(0x00)  # Data length: 0 bytes
-        
-        # Calculate checksum (sum of ALL bytes including header, mod 256)
-        checksum = sum(packet) & 0xFF
-        packet.append(checksum)
-        
-        return bytes(packet)
+    def __init__(self, port: str):
+        self.port = port
     
-    def _get_provisioning_state(self, ser, debug=False) -> str:
-        """Request current provisioning state"""
-        # Build state request command (0x02)
-        # Packet format (12 bytes total):
-        # Bytes 1-6: "IMPROV" header
-        # Byte 7: 0x01 (Version)
-        # Byte 8: 0x03 (Type = RPC Command)
-        # Byte 9: 0x02 (Length = 2 bytes: command + data_length)
-        # Byte 10: 0x02 (Command = Request current state)
-        # Byte 11: 0x00 (Data length = 0 for this command)
-        # Byte 12: Checksum (sum of ALL bytes 1-11, mod 256)
-        packet = bytearray(b'IMPROV')
-        packet.append(0x01)  # Version
-        packet.append(0x03)  # Type: RPC Command
-        packet.append(0x02)  # Length: 2 bytes (command + data_length)
-        packet.append(0x02)  # Command: Request current state
-        packet.append(0x00)  # Data length: 0 bytes
-        checksum = sum(packet) & 0xFF
-        packet.append(checksum)
+    def discover(self, debug: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Discover AWA protocol via interactive test at 2Mbps
+        """
+        print(f"  Testing AWA...")
         
-        ser.write(bytes(packet))
-        ser.flush()
+        result = test_protocol_interactive(self.port, 2000000, 'awa', led_count=10, debug=debug)
         
-        import time
-        time.sleep(0.2)
-        
-        response = ser.read(100)
-        if len(response) >= 10 and response[:6] == b'IMPROV':
-            # Parse state from response
-            if response[7] == 0x01:  # Current state packet
-                state_code = response[9] if len(response) > 9 else 0
-                state_map = {
-                    0x02: 'Ready',
-                    0x03: 'Provisioning',
-                    0x04: 'Provisioned'
-                }
-                return state_map.get(state_code, 'Unknown')
-        
-        return 'Unknown'
-    
-    def _parse_improv_response(self, response: bytes, debug: bool = False) -> Optional[Dict[str, Any]]:
-        """Parse Improv RPC result packet (may contain multiple packets)"""
-        # Response may contain multiple Improv packets (e.g., error state + RPC result)
-        # Search through the response for an RPC Result packet (type 0x04)
-        
-        offset = 0
-        while offset < len(response) - 10:
-            # Look for IMPROV header
-            if response[offset:offset+6] != b'IMPROV':
-                offset += 1
-                continue
-            
-            version = response[offset + 6]
-            packet_type = response[offset + 7]
-            length = response[offset + 8]
-            
-            if debug:
-                print(f"    [DEBUG] Packet at offset {offset}: Version: {version}, Type: {packet_type}, Length: {length}")
-            
-            # Check if this is an RPC Result packet (0x04)
-            if packet_type == 0x04:
-                # Parse this packet
-                packet_data = response[offset:]
-                return self._parse_rpc_result(packet_data, debug)
-            
-            # Skip to next potential packet
-            # Packet size = 6 (header) + 1 (ver) + 1 (type) + 1 (len) + length + 1 (checksum)
-            packet_size = 10 + length
-            offset += packet_size
-        
-        if debug:
-            print(f"    [DEBUG] No RPC result packet found in response")
-        return None
-    
-    def _parse_rpc_result(self, packet_data: bytes, debug: bool = False) -> Optional[Dict[str, Any]]:
-        """Parse an RPC result packet (type 0x04)"""
-        if len(packet_data) < 12:
-            return None
-        
-        # RPC Result format:
-        # Byte 9: Command that was executed (echo)
-        # Byte 10: Total length of string data
-        # Byte 11+: Length-prefixed strings
-        command_echo = packet_data[9]
-        total_data_length = packet_data[10]
-        
-        if debug:
-            print(f"    [DEBUG] Command echo: 0x{command_echo:02x}")
-            print(f"    [DEBUG] Total data length: {total_data_length} bytes")
-        
-        # Parse strings from data section (starting after total length byte)
-        strings = []
-        offset = 11
-        
-        while offset < len(packet_data) - 1:  # -1 for checksum
-            if offset >= len(packet_data):
-                break
-            
-            str_len = packet_data[offset]
-            offset += 1
-            
-            if str_len == 0 or offset + str_len > len(packet_data):
-                break
-            
-            string = packet_data[offset:offset + str_len].decode('utf-8', errors='ignore')
-            strings.append(string)
-            offset += str_len
-        
-        if debug:
-            print(f"    [DEBUG] Parsed strings: {strings}")
-        
-        # Device info should have at least 4 strings:
-        # firmware_name, firmware_version, hardware, device_name
-        if len(strings) >= 4:
+        if result:
+            print(f"    ✓ AWA detected at 2Mbps")
             return {
-                'protocol': 'improv',
-                'detected_by': 'device_info_response',
-                'baud_rate': 115200,
-                'firmware_name': strings[0],
-                'firmware_version': strings[1],
-                'hardware': strings[2],
-                'device_name': strings[3],
-                'improv_capable': True
+                'protocol': 'awa',
+                'baud_rate': 2000000,
+                'led_count': 100,  # Default, user should adjust
+                'pixel_format': 'GRB'
             }
+        else:
+            print(f"    ✗ AWA not detected")
+            return None
+
+
+# ============================================================================
+# Adalight Interactive Discovery
+# ============================================================================
+
+class AdalightDiscovery:
+    """Adalight protocol discovery with interactive multi-speed testing"""
+    
+    def __init__(self, port: str):
+        self.port = port
+    
+    def discover(self, debug: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Discover Adalight protocol by testing multiple baud rates interactively
+        """
+        print(f"  Testing Adalight...")
         
+        test_speeds = [115200, 230400, 460800, 500000, 576000, 921600, 1000000, 1500000, 2000000]
+        
+        for speed in test_speeds:
+            result = test_protocol_interactive(self.port, speed, 'adalight', led_count=10, debug=debug)
+            
+            if result:
+                print(f"    ✓ Adalight detected at {speed} baud")
+                return {
+                    'protocol': 'adalight',
+                    'baud_rate': speed,
+                    'led_count': 100,  # Default, user should adjust
+                    'pixel_format': 'GRB'
+                }
+            else:
+                print(f"    ✗ {speed} baud failed")
+        
+        print(f"    ✗ Adalight not detected at any speed")
         return None
 
 
-class AWADiscovery(ProtocolDiscovery):
-    """
-    AWA (Advanced Wireless Addressable) protocol discovery
-    Used by HyperSerialPico and similar devices
-    
-    AWA is an extension of the Adalight protocol for high-speed LED control.
-    It doesn't have a separate identification protocol - devices are detected
-    by their ability to operate at high baud rates and respond to Adalight frames.
-    """
-    
-    def get_protocol_name(self) -> str:
-        return "AWA"
-    
-    def discover(self, debug=False) -> bool:
-        """
-        Attempt to detect AWA/Adalight protocol device
-        AWA devices typically operate at 2000000 baud and use Adalight protocol
-        """
-        # AWA devices typically use very high baud rates
-        # Standard Adalight uses 115200, AWA uses up to 2000000
-        baud_rates = [2000000, 1000000, 115200]
-        
-        if debug:
-            print(f"\n    [DEBUG] Starting AWA discovery on {self.port}")
-            print(f"    [DEBUG] AWA devices use Adalight protocol at high speed")
-        
-        for baud_rate in baud_rates:
-            if debug:
-                print(f"    [DEBUG] Trying baud rate: {baud_rate}")
-            
-            try:
-                with serial.Serial(self.port, baud_rate, timeout=0.5) as ser:
-                    if debug:
-                        print(f"    [DEBUG] Port opened successfully")
-                    
-                    # Clear buffers
-                    ser.reset_input_buffer()
-                    ser.reset_output_buffer()
-                    
-                    # Method 1: Send Adalight header to trigger response
-                    # Adalight frame: 'A' 'd' 'a' + LED count high + LED count low + checksum
-                    # Use a small test frame (10 LEDs)
-                    led_count = 10
-                    ada_header = bytearray([
-                        0x41, 0x64, 0x61,  # 'Ada' header
-                        (led_count >> 8) & 0xFF,  # LED count high byte
-                        led_count & 0xFF,         # LED count low byte
-                        (led_count >> 8) ^ (led_count & 0xFF) ^ 0x55  # Checksum
-                    ])
-                    
-                    if debug:
-                        print(f"    [DEBUG] Sending Adalight test frame: {ada_header.hex()}")
-                    
-                    # Send test frame
-                    ser.write(bytes(ada_header))
-                    ser.flush()
-                    
-                    # Wait a moment for device to process (500ms timeout)
-                    import time
-                    time.sleep(0.05)
-                    
-                    # Check if device is ready (some devices send acknowledgment)
-                    response = ser.read(100)
-                    
-                    if debug:
-                        if response:
-                            print(f"    [DEBUG] Received {len(response)} bytes: {response.hex()}")
-                        else:
-                            print(f"    [DEBUG] No response (expected for most AWA devices)")
-                    
-                    # Method 2: Try to detect device by USB VID/PID
-                    # Raspberry Pi Pico devices have specific USB identifiers
-                    try:
-                        for port in serial.tools.list_ports.comports():
-                            if port.device == self.port:
-                                # Check for known AWA device identifiers
-                                vid_pid_known = False
-                                device_name = ""
-                                
-                                # Raspberry Pi Pico: VID=0x2E8A, PID=0x000A or 0x0009
-                                if 'VID:PID=2E8A:000A' in port.hwid.upper() or 'VID:PID=2E8A:0009' in port.hwid.upper():
-                                    vid_pid_known = True
-                                    device_name = "Raspberry Pi Pico (RP2040)"
-                                
-                                # Adafruit boards typically use VID=0x239A
-                                elif 'VID:PID=239A' in port.hwid.upper():
-                                    vid_pid_known = True
-                                    device_name = "Adafruit RP2040 board"
-                                
-                                if debug:
-                                    print(f"    [DEBUG] USB Device: {port.description}")
-                                    print(f"    [DEBUG] Hardware ID: {port.hwid}")
-                                    if vid_pid_known:
-                                        print(f"    [DEBUG] [OK] Recognized as: {device_name}")
-                                
-                                # If we found a known device that opened successfully at high baud rate
-                                if vid_pid_known and baud_rate >= 1000000:
-                                    if debug:
-                                        print(f"    [DEBUG] [OK] AWA device detected by USB VID/PID at high baud rate!")
-                                    
-                                    self.device_info = {
-                                        'protocol': 'awa',
-                                        'detected_by': 'usb_vid_pid',
-                                        'baud_rate': baud_rate,
-                                        'device_name': device_name,
-                                        'vid_pid': port.hwid
-                                    }
-                                    return True
-                    except Exception as e:
-                        if debug:
-                            print(f"    [DEBUG] USB detection error: {e}")
-                    
-                    # Method 3: If high baud rate works, assume it's an AWA-capable device
-                    # Regular Arduino/Adalight typically can't handle 2000000 baud reliably
-                    if baud_rate >= 2000000:
-                        if debug:
-                            print(f"    [DEBUG] [OK] Port accepts ultra-high baud rate (2Mbps) - likely AWA device")
-                        
-                        self.device_info = {
-                            'protocol': 'awa',
-                            'detected_by': 'high_baud_rate',
-                            'baud_rate': baud_rate,
-                            'note': 'Device accepts 2Mbps - typical of HyperSerialPico/AWA'
-                        }
-                        return True
-                        
-            except (serial.SerialException, OSError) as e:
-                if debug:
-                    print(f"    [DEBUG] Error at {baud_rate}: {e}")
-                continue
-        
-        if debug:
-            print(f"    [DEBUG] No AWA device detected")
-        return False
-
+# ============================================================================
+# Serial Port Listing
+# ============================================================================
 
 def list_serial_ports() -> List[serial.tools.list_ports.ListPortInfo]:
-    """
-    List all available serial ports on the system
-    Cross-platform using pyserial's list_ports
-    """
+    """List all available serial ports"""
     ports = serial.tools.list_ports.comports()
     return sorted(ports, key=lambda p: p.device)
 
@@ -701,213 +564,59 @@ def print_port_info(port_info: serial.tools.list_ports.ListPortInfo):
     """Print detailed information about a serial port"""
     print(f"\nPort: {port_info.device}")
     print(f"  Description: {port_info.description}")
-    print(f"  Hardware ID: {port_info.hwid}")
     if port_info.manufacturer:
         print(f"  Manufacturer: {port_info.manufacturer}")
     if port_info.product:
         print(f"  Product: {port_info.product}")
-    if port_info.serial_number:
-        print(f"  Serial Number: {port_info.serial_number}")
 
 
-def discover_protocols(port: str, debug: bool = False) -> List[ProtocolDiscovery]:
+# ============================================================================
+# Port Scanning with Interactive Protocol Selection
+# ============================================================================
+
+def scan_port(port: str, debug: bool = False) -> Optional[Dict[str, Any]]:
     """
-    Attempt to discover which protocols a port speaks
-    Returns list of successful protocol discoveries
+    Scan a port for LED protocols with user confirmation for each protocol
+    Tests in order: WLED → AWA → Adalight
+    WLED detection skips AWA and Adalight
     """
-    # AWA comes before Adalight since it has a defined protocol (not timeout-based)
-    discoveries = [
-        ImprovDiscovery(port),
-        WLEDDiscovery(port),
-        AWADiscovery(port),
-        AdaLightDiscovery(port)
-    ]
+    print(f"\nScanning {port}...")
     
-    detected = []
-    wled_detected = False
-    awa_detected = False
-    
-    for discovery in discoveries:
-        print(f"  Trying {discovery.get_protocol_name()}...")
-        sys.stdout.flush()  # Ensure output appears immediately
-        
-        # Add small delay between protocol checks to let device settle
-        import time
-        time.sleep(0.1)
-        
-        # Skip Adalight magic word detection if WLED or AWA already detected
-        skip_adalight = isinstance(discovery, AdaLightDiscovery) and (wled_detected or awa_detected)
-        
-        # Pass appropriate flags to discoveries
-        if isinstance(discovery, AdaLightDiscovery):
-            result = discovery.discover(debug=debug, skip=skip_adalight)
-        elif isinstance(discovery, (AWADiscovery, WLEDDiscovery, ImprovDiscovery)):
-            result = discovery.discover(debug=debug)
-        else:
-            result = discovery.discover()
-        
+    # Test WLED first (most feature-rich)
+    if ask_user(f"  Test WLED on {port}?"):
+        wled = WLEDDiscovery(port)
+        result = wled.discover(debug=debug)
         if result:
-            print("    => DETECTED")
-            detected.append(discovery)
-            
-            # Track what was detected
-            if discovery.get_device_info().get('protocol') == 'wled':
-                wled_detected = True
-            elif discovery.get_device_info().get('protocol') == 'awa':
-                awa_detected = True
-        else:
-            if skip_adalight:
-                print("    => SKIPPED (already detected via other protocol)")
-            else:
-                print("    => NOT DETECTED")
+            result['port'] = port
+            print(f"  ✓ WLED detected - skipping AWA and Adalight tests")
+            return result
     
-    return detected
+    # Test AWA
+    if ask_user(f"  Test AWA on {port}?"):
+        awa = AWADiscovery(port)
+        result = awa.discover(debug=debug)
+        if result:
+            result['port'] = port
+            return result
+    
+    # Test Adalight
+    if ask_user(f"  Test Adalight on {port}?"):
+        adalight = AdalightDiscovery(port)
+        result = adalight.discover(debug=debug)
+        if result:
+            result['port'] = port
+            return result
+    
+    print(f"  ✗ No protocols detected on {port}")
+    return None
 
 
-def main():
-    """Main entry point"""
-    # Check for debug flag
-    debug = '--debug' in sys.argv or '-d' in sys.argv
-    
-    print("OpenPixelControlSerial - Python Implementation")
-    print("=" * 50)
-    if debug:
-        print("DEBUG MODE ENABLED")
-        print("=" * 50)
-    print()
-    
-    # List all available serial ports
-    ports = list_serial_ports()
-    
-    if not ports:
-        print("No serial ports found on this system.")
-        return 1
-    
-    print(f"Found {len(ports)} serial port(s):\n")
-    
-    # Display port information
-    for port_info in ports:
-        print_port_info(port_info)
-    
-    print("\n" + "=" * 50)
-    print("Attempting protocol discovery on each port...")
-    print("=" * 50)
-    
-    # Try to discover protocols on each port
-    all_discovered = {}
-    for port_info in ports:
-        print(f"\nScanning {port_info.device}...")
-        discovered = discover_protocols(port_info.device, debug=debug)
-        
-        if discovered:
-            all_discovered[port_info.device] = discovered
-    
-    # Summary
-    print("\n" + "=" * 50)
-    print("Discovery Summary")
-    print("=" * 50)
-    
-    if all_discovered:
-        for port, discoveries in all_discovered.items():
-            print(f"\n{port}:")
-            for discovery in discoveries:
-                print(f"  - {discovery.get_protocol_name()}")
-                info = discovery.get_device_info()
-                
-                # Pretty-print WLED device information
-                if info.get('protocol') == 'wled' and info.get('full_json'):
-                    print(f"\n  WLED Device Information:")
-                    print(f"  " + "="*60)
-                    wled_data = info['full_json']
-                    wled_info = wled_data.get('info', {})
-                    
-                    print(f"  Device: {wled_info.get('brand', 'Unknown')} {wled_info.get('product', '')}")
-                    print(f"  Name: {wled_info.get('name', 'WLED')}")
-                    print(f"  Version: {wled_info.get('ver', 'unknown')}")
-                    print(f"  MAC Address: {wled_info.get('mac', 'N/A')}")
-                    
-                    # LED configuration
-                    leds = wled_info.get('leds', {})
-                    print(f"\n  LED Configuration:")
-                    print(f"    Count: {leds.get('count', 0)} LEDs")
-                    print(f"    Power: {leds.get('pwr', 0)}mW")
-                    print(f"    FPS: {leds.get('fps', 0)}")
-                    print(f"    Max Segments: {leds.get('maxseg', 0)}")
-                    
-                    # WiFi information if available
-                    wifi = wled_info.get('wifi', {})
-                    if wifi.get('ip') or wifi.get('bssid'):
-                        print(f"\n  WiFi Information:")
-                        if wifi.get('ip'):
-                            print(f"    IP Address: {wifi['ip']}")
-                        if wifi.get('bssid'):
-                            print(f"    BSSID: {wifi['bssid']}")
-                        if wifi.get('signal'):
-                            print(f"    Signal: {wifi['signal']}%")
-                        if wifi.get('channel'):
-                            print(f"    Channel: {wifi['channel']}")
-                    
-                    # Hardware info
-                    print(f"\n  Hardware:")
-                    print(f"    Architecture: {wled_info.get('arch', 'Unknown')}")
-                    print(f"    Core Version: {wled_info.get('core', 'Unknown')}")
-                    print(f"    Flash Size: {wled_info.get('getflash', 0) // 1024}KB")
-                    print(f"    Free Flash: {wled_info.get('getfreeflash', 0) // 1024}KB")
-                    print(f"    Free Heap: {wled_info.get('freeheap', 0)} bytes")
-                    print(f"    CPU Frequency: {wled_info.get('cpufreqmhz', 0)}MHz")
-                    print(f"    Uptime: {wled_info.get('uptime', 0)} seconds")
-                    
-                    print(f"  " + "="*60)
-                    
-                    # Check and warn about LIVE mode status
-                    live_mode = info.get('live_mode', False)
-                    if not live_mode:
-                        print(f"\n  " + "!"*60)
-                        print(f"  [WARNING] LIVE MODE IS DISABLED!")
-                        print(f"  [WARNING] Serial LED data will NOT work until LIVE is enabled!")
-                        print(f"  [WARNING] Device will not respond to Adalight/AWA commands!")
-                        print(f"  !")
-                        print(f"  !  To enable LIVE mode, you need to configure the device.")
-                        print(f"  !  This is a read-only discovery tool.")
-                        print(f"  " + "!"*60)
-                
-                # Print standard info for all devices
-                print(f"\n  Configuration:")
-                for key, value in info.items():
-                    if key not in ['response', 'full_json']:  # Don't print full response or JSON
-                        print(f"    {key}: {value}")
-        
-        # Generate config file
-        print("\n" + "=" * 50)
-        print("Generating Configuration")
-        print("=" * 50)
-        
-        config = generate_config(all_discovered)
-        config_path = "config.json"
-        
-        # Check if file exists and warn user
-        if os.path.exists(config_path):
-            print(f"\nWARNING: {config_path} already exists and will be overwritten.")
-        
-        try:
-            with open(config_path, 'w') as f:
-                json.dump(config, f, indent=2)
-            print(f"\n[OK] Configuration saved to: {config_path}")
-            print(f"  Review and adjust LED counts and pixel formats as needed.")
-        except Exception as e:
-            print(f"\n[ERROR] Error writing config file: {e}")
-            return 1
-    else:
-        print("\nNo LED controller devices detected.")
-        print("Make sure your devices are connected and powered on.")
-    
-    return 0
+# ============================================================================
+# Configuration Generation
+# ============================================================================
 
-
-def generate_config(discovered_devices: Dict[str, List[ProtocolDiscovery]]) -> Dict[str, Any]:
-    """
-    Generate OpenPixelControlSerial configuration from discovered devices
-    """
+def generate_config(detected_devices: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Generate OpenPixelControlSerial configuration from detected devices"""
     config = {
         "opc": {
             "host": "0.0.0.0",
@@ -917,133 +626,148 @@ def generate_config(discovered_devices: Dict[str, List[ProtocolDiscovery]]) -> D
     }
     
     offset = 0
-    processed_ports = set()
     
-    for port, discoveries in discovered_devices.items():
-        # Skip ports we've already processed
-        if port in processed_ports:
-            continue
+    for port, device_info in detected_devices.items():
+        output = {
+            "port": port,
+            "protocol": device_info.get('protocol', 'unknown'),
+            "baud_rate": device_info.get('baud_rate', 115200),
+            "opc_channel": 0,
+            "led_count": device_info.get('led_count', 100),
+            "opc_offset": offset,
+            "pixel_format": device_info.get('pixel_format', 'GRB')
+        }
         
-        # Find the best protocol for this port (prefer specific protocols over generic)
-        # Priority: WLED > Improv > Adalight > AWA
-        best_discovery = None
-        for discovery in discoveries:
-            protocol = discovery.get_device_info().get('protocol')
-            if protocol == 'wled':
-                best_discovery = discovery
-                break
-            elif protocol == 'improv' and (not best_discovery or best_discovery.get_device_info().get('protocol') == 'awa'):
-                best_discovery = discovery
-            elif protocol == 'adalight' and (not best_discovery or best_discovery.get_device_info().get('protocol') == 'awa'):
-                best_discovery = discovery
-            elif protocol == 'awa' and not best_discovery:
-                best_discovery = discovery
+        # Add WLED-specific fields
+        if device_info.get('hardware_type') == 'WLED':
+            output['hardware_type'] = 'WLED'
+            output['handshake_baud_rate'] = device_info.get('handshake_baud_rate', 115200)
+            output['device_name'] = device_info.get('name', 'WLED Device')
+            
+            if device_info.get('version'):
+                output['wled_version'] = device_info['version']
+            if device_info.get('brand'):
+                output['wled_brand'] = device_info['brand']
+            if device_info.get('product'):
+                output['wled_product'] = device_info['product']
+            if device_info.get('mac'):
+                output['mac'] = device_info['mac']
         
-        if best_discovery:
-            info = best_discovery.get_device_info()
-            protocol = info.get('protocol', 'unknown')
-            
-            # Check if AWA was also detected on this port
-            awa_detection = next((d for d in discoveries if d.get_device_info().get('protocol') == 'awa'), None)
-            awa_also_detected = awa_detection is not None
-            
-            # Handle WLED devices
-            if protocol == 'wled':
-                supported_protocols = info.get('supported_protocols', ['adalight', 'tpm2']).copy()
-                
-                # Determine best protocol and baud rate
-                # If AWA was also detected, prefer AWA at high speed for LED data
-                if awa_also_detected:
-                    if 'awa' not in supported_protocols:
-                        supported_protocols.append('awa')
-                    protocol_to_use = "awa"
-                    baud_rate = awa_detection.get_device_info().get('baud_rate', 2000000)
-                    protocol_note = "Using AWA protocol at high speed for LED data, JSON API works at 115200"
-                else:
-                    protocol_to_use = "adalight"
-                    baud_rate = info.get('baud_rate', 115200)
-                    protocol_note = "Using Adalight protocol"
-                
-                output = {
-                    "port": port,
-                    "protocol": protocol_to_use,
-                    "supported_protocols": supported_protocols,
-                    "baud_rate": baud_rate,
-                    "opc_channel": 0,
-                    "led_count": info.get('led_count', 100),
-                    "opc_offset": offset,
-                    "pixel_format": info.get('pixel_format', 'GRB'),
-                    "device_name": info.get('name', 'WLED Device'),
-                    "device_type": "WLED",
-                    "wled_version": info.get('version', 'unknown'),
-                    "wled_brand": info.get('brand', ''),
-                    "wled_product": info.get('product', ''),
-                    "note": protocol_note
-                }
-                
-                # Mark as disabled if LIVE mode is off
-                if not info.get('live_mode', False):
-                    output['disabled'] = True
-                    output['disabled_reason'] = 'WLED LIVE mode is disabled - enable via web interface'
-                
-                # Add WiFi info if available
-                if info.get('wifi_ip'):
-                    output['wifi_ip'] = info['wifi_ip']
-                if info.get('mac'):
-                    output['mac'] = info['mac']
-                    
-                config['outputs'].append(output)
-                offset += info.get('led_count', 100)
-            
-            # Handle Improv-only devices
-            elif protocol == 'improv':
-                output = {
-                    "port": port,
-                    "protocol": "unknown_improv",
-                    "baud_rate": 115200,
-                    "opc_channel": 0,
-                    "led_count": 100,  # Placeholder - must configure manually
-                    "opc_offset": offset,
-                    "pixel_format": "GRB",  # Default
-                    "needs_configuration": True,
-                    "device_name": info.get('device_name', 'Unknown Device'),
-                    "firmware": info.get('firmware_name', 'Unknown'),
-                    "hardware": info.get('hardware', 'Unknown')
-                }
-                config['outputs'].append(output)
-                offset += 100
-            
-            # Handle AWA devices
-            elif protocol == 'awa':
-                output = {
-                    "port": port,
-                    "protocol": "awa",
-                    "baud_rate": info.get('baud_rate', 2000000),
-                    "opc_channel": 0,
-                    "led_count": 100,  # User should adjust
-                    "opc_offset": offset,
-                    "pixel_format": "GRB"
-                }
-                config['outputs'].append(output)
-                offset += 100
-            
-            # Handle Adalight devices (when implemented)
-            elif protocol == 'adalight':
-                output = {
-                    "port": port,
-                    "protocol": "adalight",
-                    "baud_rate": info.get('baud_rate', 115200),
-                    "opc_channel": 0,
-                    "led_count": 100,  # User should adjust
-                    "opc_offset": offset,
-                    "pixel_format": "GRB"
-                }
-                config['outputs'].append(output)
-                offset += 100
-            
-            processed_ports.add(port)
+        config['outputs'].append(output)
+        offset += device_info.get('led_count', 100)
     
     return config
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+def main():
+    """Main entry point"""
+    debug = '--debug' in sys.argv or '-d' in sys.argv
+    
+    print("=" * 70)
+    print("OpenPixelControlSerial - Interactive Discovery Tool")
+    print("=" * 70)
+    if debug:
+        print("DEBUG MODE ENABLED")
+        print("=" * 70)
+    print()
+    print("⚠️  IMPORTANT: WLED Device Setup")
+    print("=" * 70)
+    print("If you have WLED devices, you MUST power cycle them BEFORE running")
+    print("this tool. WLED's baud rate changes are temporary and don't persist")
+    print("across reboots. Power cycling ensures we detect the correct default")
+    print("baud rate.")
+    print()
+    print("Steps:")
+    print("  1. Unplug all WLED devices from power")
+    print("  2. Wait 5 seconds")
+    print("  3. Plug them back in")
+    print("  4. Wait for them to fully boot (LEDs should show startup pattern)")
+    print("=" * 70)
+    print()
+    
+    # Require user confirmation
+    if not ask_user("Have you power cycled all WLED devices?"):
+        print("\nPlease power cycle your WLED devices and run this tool again.")
+        return 0
+    
+    print()
+    print("This tool will test each serial port for LED controller protocols.")
+    print("You'll be asked to confirm if LEDs blink during each test.")
+    print()
+    
+    # List all serial ports
+    ports = list_serial_ports()
+    
+    if not ports:
+        print("No serial ports found on this system.")
+        return 1
+    
+    print(f"Found {len(ports)} serial port(s):")
+    for port_info in ports:
+        print(f"  • {port_info.device} - {port_info.description}")
+    
+    print("\n" + "=" * 70)
+    print("Starting Interactive Discovery")
+    print("=" * 70)
+    
+    # Scan each port
+    detected_devices = {}
+    
+    for port_info in ports:
+        result = scan_port(port_info.device, debug=debug)
+        if result:
+            detected_devices[port_info.device] = result
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("Discovery Summary")
+    print("=" * 70)
+    
+    if detected_devices:
+        for port, info in detected_devices.items():
+            print(f"\n{port}:")
+            print(f"  Protocol: {info.get('protocol')}")
+            if info.get('hardware_type') == 'WLED':
+                print(f"  Hardware: WLED")
+                print(f"  Device: {info.get('name')}")
+                print(f"  JSON API: {info.get('handshake_baud_rate')} baud")
+                print(f"  LED Data: {info.get('baud_rate')} baud")
+            else:
+                print(f"  Baud Rate: {info.get('baud_rate')}")
+            print(f"  LED Count: {info.get('led_count')} (adjust as needed)")
+            print(f"  Pixel Format: {info.get('pixel_format')}")
+        
+        # Generate and save config
+        print("\n" + "=" * 70)
+        print("Generating Configuration")
+        print("=" * 70)
+        
+        config = generate_config(detected_devices)
+        config_path = "config.json"
+        
+        if os.path.exists(config_path):
+            print(f"\nWARNING: {config_path} already exists and will be overwritten.")
+            if not ask_user("Continue?"):
+                print("Configuration not saved.")
+                return 0
+        
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+            print(f"\n✓ Configuration saved to: {config_path}")
+            print(f"  Review and adjust LED counts and other settings as needed.")
+        except Exception as e:
+            print(f"\n✗ Error writing config file: {e}")
+            return 1
+    else:
+        print("\nNo LED controller devices detected.")
+        print("Make sure your devices are connected and powered on.")
+    
+    return 0
 
 
 if __name__ == "__main__":

@@ -12,7 +12,9 @@
       "opc_channel": 0,
       "led_count": 300,
       "opc_offset": 0,
-      "pixel_format": "GRB"
+      "pixel_format": "GRB",
+      "_comment_hardware_type": "hardware_type is optional - set to 'WLED' to enable WLED-specific initialization with JSON handshake and speed switching",
+      "_comment_handshake": "handshake_baud_rate is optional - if specified with hardware_type='WLED', device will be initialized at this speed before switching to baud_rate for LED data"
     }
   ]
 }

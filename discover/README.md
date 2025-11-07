@@ -236,6 +236,25 @@ This implementation uses `pyserial` which provides cross-platform serial port su
 
 The serial port detection automatically handles platform differences.
 
+## Configuring WLED Devices
+
+After discovering WLED devices, you'll typically need to **enable LIVE mode** for them to accept serial LED data. WLED devices ship with LIVE mode disabled by default, which means they'll run internal effects/patterns instead of accepting real-time data.
+
+Use the **WLED Configuration Tool** to enable LIVE mode:
+
+```bash
+cd ../wled-config
+python wled_config.py --enable-live
+```
+
+For more information, see the [WLED Configuration Tool documentation](../wled-config/README.md).
+
+**Why LIVE mode is required:**
+- **LIVE mode DISABLED**: Device runs internal effects, ignores serial LED data
+- **LIVE mode ENABLED**: Device accepts Adalight/AWA/TPM2 serial LED data
+
+The discovery tool will warn you if LIVE mode is disabled on detected WLED devices.
+
 ## Next Steps
 
 - [ ] Implement OPC server (TCP listener)

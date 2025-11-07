@@ -13,14 +13,28 @@ import socket
 import struct
 import threading
 import signal
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 from queue import Queue, Empty, Full
+from datetime import datetime
+
+# All supported WLED baud rates in priority order
+WLED_BAUD_RATES = [
+    115200,   # Default WLED speed
+    230400,
+    460800,
+    500000,
+    576000,
+    921600,
+    1000000,
+    1500000,
+    2000000,
+]
 
 
 class LEDOutput:
     """Handles serial output to LED strips with dedicated worker thread"""
     
-    def __init__(self, config: Dict[str, Any], ddebug: bool = False):
+    def __init__(self, config: Dict[str, Any], debug: bool = False, ddebug: bool = False):
         self.port = config['port']
         self.protocol = config['protocol']
         self.baud_rate = config['baud_rate']
@@ -28,8 +42,15 @@ class LEDOutput:
         self.opc_channel = config['opc_channel']
         self.opc_offset = config.get('opc_offset', 0)
         self.pixel_format = config.get('pixel_format', None)
+        self.hardware_type = config.get('hardware_type', None)
+        self.handshake_baud_rate = config.get('handshake_baud_rate', None)
+        self.debug = debug
         self.ddebug = ddebug
         self.ser = None
+        
+        # Frame timing tracking
+        self.last_frame_time = None
+        self.frame_count = 0
         
         # Determine output stride based on pixel format
         if self.pixel_format in ('RGBW', 'GRBW'):
@@ -44,14 +65,223 @@ class LEDOutput:
         self.worker_thread.start()
     
     def open(self):
-        """Open serial connection"""
+        """Open serial connection with WLED baud rate detection if needed"""
         try:
-            self.ser = serial.Serial(self.port, self.baud_rate, timeout=1)
-            time.sleep(0.1)  # Allow device to initialize
-            return True
+            # Handle WLED devices with baud rate detection
+            if self.hardware_type == "WLED":
+                self.ser = self._open_wled_port()
+            else:
+                self.ser = self._open_standard_port(self.baud_rate)
+            
+            if self.ser:
+                return True
+            return False
         except serial.SerialException as e:
             print(f"Error opening {self.port}: {e}")
             return False
+    
+    def _open_standard_port(self, baud_rate: int) -> serial.Serial:
+        """Open a standard serial port (non-WLED)"""
+        ser = serial.Serial(
+            self.port, 
+            baud_rate, 
+            timeout=1
+        )
+        time.sleep(0.1)  # Allow device to initialize
+        # Clear buffers to remove any leftover data from previous operations
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        return ser
+    
+    def _open_wled_port(self) -> Optional[serial.Serial]:
+        """Open and initialize a WLED device with baud rate detection"""
+        if self.debug:
+            print(f"Detecting WLED device on {self.port}...")
+        
+        # Build list of baud rates to try in priority order:
+        # 1. Configured baud_rate (data rate)
+        # 2. Configured handshake_baud_rate (control baud)
+        # 3. All WLED standard rates
+        baud_rates_to_try = []
+        
+        # Add configured data rate first
+        baud_rates_to_try.append(self.baud_rate)
+        
+        # Add handshake baud if different and specified
+        if self.handshake_baud_rate and self.handshake_baud_rate != self.baud_rate:
+            baud_rates_to_try.append(self.handshake_baud_rate)
+        
+        # Add all standard WLED rates (skip duplicates)
+        for rate in WLED_BAUD_RATES:
+            if rate not in baud_rates_to_try:
+                baud_rates_to_try.append(rate)
+        
+        # Try each baud rate until we get a response
+        detected_baud = None
+        wled_response = None
+        
+        for baud in baud_rates_to_try:
+            if self.debug:
+                print(f"[PROBE {self.port}] Trying baud rate {baud}...")
+            
+            response = self._try_wled_handshake(baud)
+            if response:
+                detected_baud = baud
+                wled_response = response
+                if self.debug:
+                    print(f"✓ WLED device detected at {baud} baud on {self.port}")
+                    print(f"  Response: {response.strip()[:80]}")  # First 80 chars
+                break
+            else:
+                if self.debug:
+                    print(f"  No response at {baud} baud")
+        
+        if not detected_baud:
+            print(f"✗ Failed to detect WLED device on {self.port} (tried {len(baud_rates_to_try)} baud rates)")
+            return None
+        
+        if self.ddebug:
+            print(f"[DEBUG {self.port}] WLED response: {wled_response}")
+        
+        # Now switch to the configured baud rate if different
+        if detected_baud != self.baud_rate:
+            if self.debug:
+                print(f"Switching {self.port} from {detected_baud} to {self.baud_rate} baud...")
+            
+            # Open at detected baud
+            ser = serial.Serial(self.port, detected_baud, timeout=0.5)
+            time.sleep(0.1)
+            
+            # Clear buffers before sending baud change command
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            
+            # Send baud change command
+            baud_byte = self._get_wled_baud_byte(self.baud_rate)
+            if baud_byte is None:
+                print(f"✗ Unsupported WLED baud rate: {self.baud_rate}")
+                ser.close()
+                return None
+            
+            ser.write(bytes([baud_byte]))
+            ser.flush()
+            
+            # Wait for confirmation
+            time.sleep(0.2)
+            
+            # Try to read confirmation (optional)
+            if ser.in_waiting > 0:
+                try:
+                    response = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+                    if self.ddebug:
+                        print(f"[DEBUG {self.port}] Baud change response: {response}")
+                except Exception:
+                    pass
+            
+            # Close and reopen at new baud rate
+            ser.close()
+            time.sleep(0.1)
+            
+            ser = serial.Serial(self.port, self.baud_rate, timeout=1)
+            time.sleep(0.1)  # Match discover.py timing
+            
+            # CRITICAL: Clear buffers to remove any leftover data from baud change
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            
+            if self.debug:
+                print(f"✓ WLED device on {self.port} now running at {self.baud_rate} baud")
+            
+            return ser
+        else:
+            # Already at correct baud, just open normally like discover.py
+            return self._open_standard_port(self.baud_rate)
+    
+    def _try_wled_handshake(self, baud: int) -> Optional[str]:
+        """Try WLED handshake at a specific baud rate"""
+        ser = None
+        try:
+            if self.debug:
+                print(f"  Opening port at {baud} baud...")
+            ser = serial.Serial(self.port, baud, timeout=0.5)
+            if self.debug:
+                print(f"  Port opened successfully")
+            time.sleep(0.15)  # Give device time to initialize
+            
+            # Clear any pending data aggressively
+            if self.debug:
+                print(f"  Clearing buffers...")
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            time.sleep(0.05)
+            
+            # Send WLED version query - just 'v' for quick probe
+            query = b'v'
+            if self.debug:
+                print(f"  Sending probe: {query}")
+            ser.write(query)
+            ser.flush()
+            if self.debug:
+                print(f"  Probe sent, waiting for response...")
+            
+            # Wait for response (shorter timeout since response should be immediate)
+            time.sleep(0.2)
+            
+            # Read response
+            bytes_waiting = ser.in_waiting
+            if self.debug:
+                print(f"  Bytes available to read: {bytes_waiting}")
+            
+            if bytes_waiting > 0:
+                response = ser.read(bytes_waiting).decode('utf-8', errors='ignore')
+                if self.debug:
+                    print(f"  Read {len(response)} chars: {response[:80]}")
+                
+                # Validate it looks like a valid response (any non-empty response is good)
+                if len(response) > 0:
+                    # Success - close cleanly and wait before returning
+                    if self.debug:
+                        print(f"  Valid response! Closing port...")
+                    ser.close()
+                    time.sleep(0.1)  # Let device settle after successful handshake
+                    return response
+            
+            # No valid response - close and wait longer before next attempt
+            if self.debug:
+                print(f"  No valid response, closing port and waiting...")
+            ser.close()
+            time.sleep(0.2)  # Important: wait for device to recover before next attempt
+            return None
+            
+        except Exception as e:
+            if self.debug:
+                print(f"  Exception: {e}")
+            # Make sure port is closed even on exception
+            if ser and ser.is_open:
+                try:
+                    if self.debug:
+                        print(f"  Closing port after exception...")
+                    ser.close()
+                    time.sleep(0.2)  # Wait for device to recover
+                except Exception:
+                    pass
+            return None
+    
+    @staticmethod
+    def _get_wled_baud_byte(baud: int) -> Optional[int]:
+        """Get the baud change byte for a given baud rate"""
+        baud_map = {
+            115200: 0xB0,
+            230400: 0xB1,
+            460800: 0xB2,
+            500000: 0xB3,
+            576000: 0xB4,
+            921600: 0xB5,
+            1000000: 0xB6,
+            1500000: 0xB7,
+            2000000: 0xB8,
+        }
+        return baud_map.get(baud)
     
     def close(self):
         """Close serial connection"""
@@ -180,13 +410,24 @@ class LEDOutput:
     
     def _send_adalight_frame(self, pixel_data: bytearray):
         """Send Adalight protocol frame (may raise SerialException)"""
+        # Track frame timing
+        current_time = time.time()
+        if self.last_frame_time is not None:
+            frame_delay = current_time - self.last_frame_time
+        else:
+            frame_delay = 0
+        self.last_frame_time = current_time
+        self.frame_count += 1
+        
         # Adalight header: 'Ada' + LED count high + LED count low + checksum
+        # NOTE: LED count field is (actual_count - 1), similar to AWA protocol
         led_count = len(pixel_data) // self.stride
+        count_minus_one = led_count - 1
         header = bytearray([
             0x41, 0x64, 0x61,  # 'Ada'
-            (led_count >> 8) & 0xFF,
-            led_count & 0xFF,
-            (led_count >> 8) ^ (led_count & 0xFF) ^ 0x55
+            (count_minus_one >> 8) & 0xFF,
+            count_minus_one & 0xFF,
+            (count_minus_one >> 8) ^ (count_minus_one & 0xFF) ^ 0x55
         ])
         
         # Construct complete frame
@@ -194,13 +435,47 @@ class LEDOutput:
         
         # Debug: print raw frame being sent to serial
         if self.ddebug:
-            print(f"[SERIAL] {self.port} Adalight: {len(frame)} bytes ({led_count} pixels)")
-            hex_dump = ' '.join(f'{b:02x}' for b in frame)
-            print(f"[SERIAL] Raw output: {hex_dump}")
+            ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            print(f"[{ts}] [SERIAL-TIMING] {self.port} Frame #{self.frame_count}: delay={frame_delay*1000:.1f}ms since last")
+            print(f"[{ts}] [SERIAL-DATA] {self.port} Adalight: {len(frame)} bytes total")
+            print(f"[{ts}] [SERIAL-DATA]   - Header: 6 bytes")
+            print(f"[{ts}] [SERIAL-DATA]   - Pixel data: {len(pixel_data)} bytes")
+            print(f"[{ts}] [SERIAL-DATA]   - LED count field: {led_count}")
+            print(f"[{ts}] [SERIAL-DATA]   - Configured LED count: {self.led_count}")
+            print(f"[{ts}] [SERIAL-DATA]   - Stride: {self.stride}")
+            if led_count != self.led_count:
+                print(f"[{ts}] [SERIAL-WARNING] LED count mismatch! Calculated {led_count} but config says {self.led_count}")
+            hex_dump = ' '.join(f'{b:02x}' for b in frame[:48])  # First 48 bytes
+            print(f"[{ts}] [SERIAL-HEX] First 48 bytes: {hex_dump}")
+        
+        # CRITICAL DEBUG: Log every single write operation
+        if self.ddebug:
+            ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            # Check for dangerous baud change bytes in pixel data
+            dangerous_bytes = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8]
+            found_dangerous = []
+            for i, byte in enumerate(frame):
+                if byte in dangerous_bytes:
+                    found_dangerous.append((i, byte, f"0x{byte:02X}"))
+            if found_dangerous:
+                print(f"[{ts}] [SERIAL-WARNING] Frame contains WLED baud change bytes:")
+                for pos, byte_val, hex_val in found_dangerous:
+                    in_header = "HEADER" if pos < 6 else f"PIXEL[{(pos-6)//3}] byte {(pos-6)%3}"
+                    print(f"[{ts}] [SERIAL-WARNING]   Position {pos} ({in_header}): {hex_val} = {byte_val}")
+            
+            print(f"[{ts}] [SERIAL-WRITE] Writing {len(frame)} bytes atomically")
+            print(f"[{ts}] [SERIAL-WRITE] Frame checksum: 0x{sum(frame) & 0xFF:02X}")
         
         # Send frame: header + pixel data (may raise SerialException)
-        self.ser.write(frame)
+        bytes_written = self.ser.write(frame)
         self.ser.flush()
+        
+        if self.ddebug:
+            ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            if bytes_written != len(frame):
+                print(f"[{ts}] [SERIAL-ERROR] Partial write! Expected {len(frame)}, wrote {bytes_written}")
+            else:
+                print(f"[{ts}] [SERIAL-WRITE] Successfully wrote all {bytes_written} bytes and flushed")
     
     def _send_awa_frame(self, pixel_data: bytearray):
         """Send AWA protocol frame (HyperSerialPico format, may raise SerialException)"""
@@ -274,7 +549,7 @@ class OPCServer:
     def setup_outputs(self):
         """Initialize serial outputs (each with worker thread)"""
         for output_config in self.config['outputs']:
-            output = LEDOutput(output_config, ddebug=self.ddebug)
+            output = LEDOutput(output_config, debug=self.debug, ddebug=self.ddebug)
             if output.open():
                 self.outputs.append(output)
                 print(f"✓ Opened {output.port} (channel {output.opc_channel}, offset {output.opc_offset}, "
@@ -422,11 +697,12 @@ class OPCServer:
         Each output gets its slice based on opc_offset and led_count
         """
         if self.ddebug:
-            print(f"[DEBUG] Received: channel={channel}, byte_count={len(pixel_data)}, "
+            ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            print(f"[{ts}] [DEBUG] Received: channel={channel}, byte_count={len(pixel_data)}, "
                   f"pixel_count={len(pixel_data)//3}")
             # Show first few pixels as hex
             hex_dump = ' '.join(f'{b:02x}' for b in pixel_data[:30])
-            print(f"[DEBUG] First 30 bytes received: {hex_dump}")
+            print(f"[{ts}] [DEBUG] First 30 bytes received: {hex_dump}")
         
         # Distribute to each serial output listening to this channel
         for output in self.outputs:
@@ -443,18 +719,18 @@ class OPCServer:
             needed_bytes = output.led_count * 3
             
             # Slice data for this output (handles overlaps gracefully)
+            # Truncates if too much data, sends less if not enough
             end_byte = offset_bytes + needed_bytes
             sliced_data = bytearray(pixel_data[offset_bytes:end_byte])
             
-            # DO NOT pad with zeros - send only the data we received
-            # If we got fewer pixels than configured, send fewer pixels
-            
             # Send to this output's queue (non-blocking)
+            # Adalight header will reflect actual pixel count sent
             if self.ddebug:
-                print(f"[DEBUG] Output {output.port}: sliced={len(sliced_data)} bytes "
+                ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                print(f"[{ts}] [DEBUG] Output {output.port}: sliced={len(sliced_data)} bytes "
                       f"({len(sliced_data)//3} pixels), needed={needed_bytes} bytes")
                 hex_dump = ' '.join(f'{b:02x}' for b in sliced_data[:30])
-                print(f"[DEBUG] First 30 bytes to output: {hex_dump}")
+                print(f"[{ts}] [DEBUG] First 30 bytes to output: {hex_dump}")
             output.put_frame(sliced_data)
             self.frames_sent += 1
     

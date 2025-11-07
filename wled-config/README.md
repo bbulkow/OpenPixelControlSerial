@@ -14,6 +14,8 @@ This tool allows you to configure WLED devices connected via serial port without
 
 - **Automatic Device Detection**: Reads `config.json` to find WLED devices
 - **LIVE Mode Control**: Enable or disable LIVE mode via JSON API
+- **Baud Rate Discovery**: Test which baud rates a device supports for LED data
+- **Baud Rate Configuration**: Set LED data baud rate (115200 to 2000000)
 - **Multiple Interfaces**:
   - Command-line for scripting and automation
   - Interactive menu for manual configuration
@@ -46,9 +48,11 @@ python wled_config.py
 ```
 
 Interactive mode provides a menu to:
-- View all WLED devices and their current LIVE mode status
+- View all WLED devices and their current LIVE mode status and baud rates
 - Select individual devices to configure
 - Enable/disable LIVE mode on selected devices
+- Discover supported baud rates for LED data
+- Change LED data baud rate (including 2MB for AWA)
 - Configure all devices at once
 - Query full device state (JSON output)
 
@@ -68,6 +72,18 @@ Configure specific device by port:
 ```bash
 python wled_config.py --port COM4 --enable-live
 python wled_config.py --port /dev/ttyUSB0 --disable-live
+```
+
+Discover supported baud rates:
+```bash
+python wled_config.py --discover-baud
+python wled_config.py --port COM4 --discover-baud
+```
+
+Set LED data baud rate to 2MB for AWA protocol:
+```bash
+python wled_config.py --set-baud 2000000
+python wled_config.py --port COM4 --set-baud 2000000
 ```
 
 Use alternate configuration file:
@@ -90,6 +106,8 @@ Options:
   --port PORT, -p PORT  Serial port name (e.g., COM4, /dev/ttyUSB0)
   --enable-live         Enable LIVE mode on device(s)
   --disable-live        Disable LIVE mode on device(s)
+  --discover-baud       Discover supported baud rates for LED data
+  --set-baud RATE       Set LED data baud rate (e.g., 115200, 2000000)
   --interactive, -i     Interactive mode (default if no action specified)
   --debug, -d           Enable debug output
 ```
@@ -141,6 +159,25 @@ LIVE mode determines whether the device accepts real-time LED data via serial pr
 - **LIVE Mode ENABLED**: Device accepts Adalight/AWA/TPM2 serial LED data
 - **LIVE Mode DISABLED**: Device runs internal effects/patterns, ignores serial LED data
 
+### Baud Rates
+
+The tool distinguishes between two types of baud rates:
+
+1. **JSON API Baud Rate**: Always 115200 (fixed by WLED firmware)
+   - Used for configuration commands (enable/disable LIVE mode, query status)
+   - Cannot be changed
+
+2. **LED Data Baud Rate**: Configurable from 115200 to 2000000
+   - Used for Adalight/AWA protocol LED data transmission
+   - Can be set via this tool using `--set-baud` or interactive mode
+   - Higher rates (especially 2000000) are required for AWA protocol
+   - The device firmware must support the selected baud rate
+
+**Important**: Setting the baud rate to 2MB via this tool only updates the configuration file. For AWA protocol to work at 2MB:
+- The device firmware must support high-speed operation
+- LIVE mode must be enabled
+- The serial hardware (USB-serial adapter, cables) must handle the speed
+
 ### Commands Used
 
 The tool sends JSON commands to WLED devices:
@@ -172,7 +209,7 @@ The tool sends JSON commands to WLED devices:
    ```bash
    cd ../wled-config
    python wled_config.py
-   # Interactive menu will show current LIVE status
+   # Interactive menu will show current LIVE status and baud rates
    ```
 
 3. **Enable LIVE mode** on all devices:
@@ -180,7 +217,16 @@ The tool sends JSON commands to WLED devices:
    python wled_config.py --enable-live
    ```
 
-4. **Verify** the change was applied:
+4. **For AWA protocol, discover and set baud rate to 2MB**:
+   ```bash
+   # First, discover what baud rates the device supports
+   python wled_config.py --discover-baud
+   
+   # If 2000000 is supported, set it
+   python wled_config.py --set-baud 2000000
+   ```
+
+5. **Verify** the changes were applied:
    ```bash
    python wled_config.py
    # Check status in interactive menu

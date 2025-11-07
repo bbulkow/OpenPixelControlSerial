@@ -27,7 +27,11 @@ class LEDOutput:
     def open(self):
         """Open serial connection"""
         try:
-            self.ser = serial.Serial(self.port, self.baud_rate, timeout=1)
+            self.ser = serial.Serial(
+                self.port, 
+                self.baud_rate, 
+                timeout=1
+            )
             time.sleep(0.1)  # Allow device to initialize
             return True
         except serial.SerialException as e:
@@ -366,6 +370,8 @@ Examples:
                        help='Green value (0-255) for patterns requiring RGB')
     parser.add_argument('--b', type=int, metavar='B',
                        help='Blue value (0-255) for patterns requiring RGB')
+    parser.add_argument('--fps', type=int,
+                       help='Override FPS from config (default: use config value or 30)')
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug output (shows first frame details)')
     
@@ -392,9 +398,13 @@ Examples:
         print("\nError: No outputs could be opened")
         sys.exit(1)
     
-    # Get target FPS from config, with fallback to 30
-    target_fps = config.get('target_fps', 30)
-    print(f"Target FPS: {target_fps}")
+    # Get target FPS - command line overrides config
+    if args.fps:
+        target_fps = args.fps
+        print(f"Target FPS: {target_fps} (from command line)")
+    else:
+        target_fps = config.get('target_fps', 30)
+        print(f"Target FPS: {target_fps} (from config)")
     
     # Create test pattern
     pattern = None
