@@ -1,23 +1,92 @@
 # OpenPixelControlSerial
 
-A bridge service that translates Open Pixel Control (OPC) protocol to serial LED protocols (AdaLight and AWA), enabling modern LED strip control with legacy-compatible tooling.
+A bridge service that translates Open Pixel Control (OPC) protocol to serial LED protocols (AdaLight and AWA, including WLED discovery protocols), enabling modern LED strip control with legacy-compatible tooling. 
 
 ## Overview
 
+I was thinking of this project because my supply of the beloved FadeCandy has dwindled, but I have LED control software - Chromatik - that is very suitable for Raspberry pi. While I often use larger more industrial LED controllers with Ethernet or ARTx, there's a place for small and simple. 
+
 OpenPixelControlSerial provides a software replacement for the discontinued FadeCandy hardware controller. It accepts OPC commands over the network and translates them to serial protocols that work with readily available, inexpensive LED controllers connected via USB/serial ports.
+
+Arguably, in retrospec, I'm finding that WLED with the Athom controllers that support Ethernet, are a better
+solution, assuming one has the physical space. At (2025) USD 25 for an ethernet based one or two channel 
+controller, Ethernet so wins over serial it's a better solution. Serial is a solution if you don't have
+space or don't have money. The ItsyBitsy RP2040 is incredibly small, requiers no level shifters, and is closer
+to $10, compared to $25.
 
 This makes it possible to:
 - Continue using OPC-compatible software and libraries
 - Drive LED strips using cheap serial controllers (Arduino-based AdaLight, AWA protocol devices)
 - Run on various platforms including Raspberry Pi, desktop computers, and servers
 - Scale to multiple LED strips across multiple serial ports
+- Apply simple conversions like RGB to RGBW, gamma, etc in cases where your controller doesn't
 
-## Background
+Because of the hard-to-discover nature of serial, I have built a "discovery" program, that allows
+you to hook up your controller and some LEDs, blink them, and create a template config
+file based on that. After you get the template right, you can switch to the OPC server.
 
-The FadeCandy was a popular USB-connected LED controller that used the Open Pixel Control protocol. However, it has been unavailable for years, leaving a gap for developers and artists who built systems around OPC. This project fills that gap by implementing OPC server functionality that bridges to modern, readily available serial LED controllers.
+I have built both a Python and Rust version. As this will run on the RPI with other software,
+the efficiency of RUST might be important. I also intend better transformations, like gamma
+or potentially temporal dithering, to be implemented only in rust.
+
+## Caveats
+
+The nature of Serial is you open and blast, and if the receiver isn't receiving packets or receiving
+gibberish, you usually don't know. This makes reliability a very sketchy thing.
+
+DO test your intended hardware! I've learned that the "it probably goes X speed" is TO BE TAKEN WITH
+A LARGE GRAIN OF SALT, and it's CRITICAL to actually try your "brain" + LED Controller, and probably
+knock a point off the fastest speed it SEEMS reliable. I am finding these small embedded devices are
+closer to 240kbit.
+
+If using WLED, it has cool features in that you can read the LED configuration (number and byte order)
+from the controller. It also has a sophisticated method for changing serial port speed "on the fly", 
+which this code uses - and then has to attempt to sense the current speed of a controller
+on every restart. While this is all very cool, you'll want to think about how to set up your WLED config.
+
+## State of the project
+
+AWA protocol ( HyperSerial ) has been tested with the ItsyBitsy RP2040.
+
+WLED discovery plus ADALIGHT has been tested with WLED 0.15 and Athom / IOTorero controllers.
+
+Tested with Windows and Linux. Please drop a line if it works on MacOS.
+
+Multiple serial output support is designed and implemented and code reviewed but not
+tested. There may be dragons. Please submit issues.
+
+Please submit issues - but honestly this is kind of a one-shot for me, so not sure how
+much support going forward.
+
+As I had a lot of little relaibility gotchas, there is substantial debug code.
+
+Note: this project coded HEAVILY with Claude - Opus 4.1 then Sonnet 4.5. License is open
+due to my feeling that Anthropic AI leaned heavily on open source, so while this is not a
+"derivitave work" in the legal sense, it is morally correct to have this code be open
+source as well.
+
+## Todo
+
+I would like to put Gamma in the RUST code.
+
+I would like the Rust code to buffer OPC and always output 30 FPS. This allows overcoming WLED's propensity
+to "timeout" (can't set timeout to infinite) on case of a hang of the sender. Also, it can be used to implement
+temporal dithering.
+
+I would like to put RGBW *with temp correction* in the RUST code (LEDs that support W advertise the temperature
+of W, but I have never seen an RGB to RGBW converter that takes temp into account).
+
+I would like to support something other than OPC. OPC being TCP based. ARTNET is more common, DDP is more
+efficient, OPC is more legacy. Again, maybe just in the RUST code.
 
 ## Project Structure
 
+### `config/` - Configuration Specifications
+- JSON configuration format documentation
+- Example configuration files
+- Multi-output setup examples
+ 
+ 
 ### `discover/` - Device Discovery Tool
 Python-based tool for detecting serial LED controllers:
 - Automatic device detection (AWA, Adalight, WLED protocols)
@@ -25,19 +94,15 @@ Python-based tool for detecting serial LED controllers:
 - Cross-platform support (Windows, macOS, Linux)
 
 ### `validate/` - Configuration Validation Tool
-Python-based tool for testing serial connections:
-- Validates configuration and connectivity
-- Test patterns (solid colors, blink, rainbow, chase)
-- Verifies pixel format transformations
+This is essentially depracated because the discover program
+flashes LEDs. It still works and has different patterns so I'm leaving
+it in.
 
 ### `opc-server-py/` - Python OPC Server
 Python-based OPC server implementation:
-- Full OPC protocol server
-- TCP network interface (standard port 7890)
+- Full OPC protocol server input (TCP, configurable port)
 - Per-channel single-depth queues for low latency
 - Multi-output support with channel routing
-- Both AWA and Adalight protocol output
-- Debug mode with FPS statistics
 
 ### `opc-test/` - OPC Test Client
 Shared test client for validating OPC servers:
@@ -45,46 +110,38 @@ Shared test client for validating OPC servers:
 - Multiple test patterns (rainbow, chase, solid colors)
 - Configurable FPS, LED count, and channels
 - Useful for testing and demonstrations
-
-### `config/` - Configuration Specifications
-- JSON configuration format documentation
-- Example configuration files
-- Multi-output setup examples
+- Easy place to add more patterns, good for validating other OPC servers
 
 ### `opc-server-rs/` - Rust OPC Server
 High-performance Rust implementation for production use:
-- High-performance async I/O with Tokio
+- High-performance async I/O using std libraries
 - Zero-copy buffer management
 - True parallel serial port handling
 - Skip-ahead frame dropping
-- Same functionality as Python version with better performance
+- All the features of the Python server, but higher performance, and a good place to add new features
 
 ## Cross-Platform Support
 
 Both implementations are designed to run on:
-- **Linux** (x86_64, ARM, including Raspberry Pi)
-- **macOS** (Intel and Apple Silicon)
-- **Windows** (10 and 11)
-
-The code abstracts platform-specific serial port handling to ensure consistent behavior across all operating systems.
+- **Linux** (TESTED WITH 2025 Raspberry Pi 4, other linuxes UNTESTED)
+- **macOS** (UNTESTED)
+- **Windows** (11))
 
 ## Related Projects
 
 ### Chromatik LED Project
-This project is designed to work seamlessly with [Chromatik](https://github.com/chromatik/chromatik), a powerful LED control framework. OpenPixelControlSerial serves as a hardware bridge, allowing Chromatik to drive physical LED installations through OPC.
+This project is designed to work seamlessly with [Chromatik](https://github.com/chromatik/chromatik), a powerful LED control framework. OpenPixelControlSerial serves as a bridge to hardware support, intended to be run on 
+the same box as Chromatik, although its use of TCP based OpenPixelControl could enable more complex uses.
 
 ### HyperSerialPico (awawa-dev)
 This code has been tested extensively with the [HyperSerialPico](https://github.com/awawa-dev/HyperSerialPico) project by awawa-dev. HyperSerialPico provides AWA protocol support on RP2040-based devices, making it an excellent hardware target for this bridge.
 
-⚠️ **Important Limitation**: HyperSerialPico firmware has known stability issues when processing frames larger than approximately 80 pixels (~240 bytes). The firmware **does not implement flow control** (neither hardware RTS/CTS nor software XON/XOFF), which can lead to buffer overruns and unrecoverable hangs when sending large frames at high data rates. Once the device enters this hung state, it typically requires a power cycle to recover and may not work reliably even with smaller frame sizes afterward.
+awawa-dev 's repos also include amusements like a WLED AWA implementation (replacing ADALIGHT with AWA).
 
-**Recommendations when using HyperSerialPico:**
-- Limit frame size to 50 pixels or fewer for reliable operation
-- Lower frame rates if experiencing instability
-- Consider alternative hardware for installations requiring >80 pixels
-- The lack of flow control is a fundamental architectural limitation of the HyperSerialPico firmware
-
-This limitation is specific to the HyperSerialPico firmware implementation and does not affect other AWA protocol devices that implement proper flow control.
+⚠️ **Important Limitation**: I found HyperSerialPico firmware did not support the number of pixels per frame
+that I hoped, in the version I used, on the RP2040 hardware. I have suspicions that this is related
+to an underlying software flaw or lack of flow control support, but didn't debug the issue. Please
+test on your hardware before trusting.
 
 ## Architecture
 
@@ -113,28 +170,6 @@ This limitation is specific to the HyperSerialPico firmware implementation and d
       ╚═════════╝
 ```
 
-## Features
-
-- **OPC Server**: Full Open Pixel Control protocol server implementation
-- **Multiple Serial Protocols**: 
-  - AdaLight protocol support
-  - AWA protocol support
-- **Multi-Port Support**: Drive multiple LED strips on different serial ports simultaneously
-- **Cross-Platform**: Runs on Linux (including Raspberry Pi), Windows, and macOS
-- **Layer Compatible**: Drop-in replacement for FadeCandy in existing OPC setups
-- **Dual Implementations**: Choose Python for flexibility or Rust for performance
-
-## Requirements
-
-- **Hardware**:
-  - Computer with USB ports (Raspberry Pi, desktop, server)
-  - Serial LED controller (HyperSerialPico, Arduino running AdaLight, AWA-compatible device)
-  - WS2812/NeoPixel or compatible LED strips
-
-- **Software**:
-  - Python 3.8+ (for Python implementation) OR Rust toolchain (for Rust implementation)
-  - Serial port access permissions
-  - Network connectivity for OPC clients
 
 ## Installation
 
@@ -146,7 +181,7 @@ cd opc-server-py/
 pip install -r requirements.txt
 ```
 
-2. Create a configuration file (see `config/config.example.json`)
+2. Create a configuration file using 'discover' or by hand (see `config/config.example.json`)
 
 3. Run the server:
 ```bash
@@ -161,11 +196,37 @@ python test_client.py --pattern rainbow --leds 100
 
 See `opc-server-py/README.md` for detailed documentation.
 
-### Rust OPC Server (Coming Soon)
+### Rust OPC Server
+
+Same as Python (above), but with Rust
+
 ```bash
 cd opc-server-rs/
 cargo run -- config.json
 ```
+
+## Configuring WLED
+
+Zeroeth, make sure your WLED is compiled with ADALIGHT support. That compile
+flag enables the JSON Serial components and ADALIGHT. I found the ATHOM / IOTORERO devices
+with a serial port come with 0.15 with Serial Live enabled. I did *not* find I needed
+to enable "live" in the WLED firmware independatly. The easiest way to test is open
+the serial port with a computer and type 'v'. If you have the inital speed right, and a version
+that supports serial, WLED will respond with "WLED" and a build version string.
+
+First, WLED expects its ADALIGHT input to be in RGB, and if you set the strips in WLED
+to be a different format, set OpenPixelControlSerial to be **RGB** not the same configuration
+as WLED. Probably setting OPCS to RGBW will not play nice with WLED!
+
+Second, consider the serial port speed. To *persistantly* set WLED's serial port speed,
+you need to use the web interface. The protocol below is for ad-hoc changes. I recommend leaving
+the WLED serial speed to 115200, the lowest common denominator. That's why this code
+shifts up to a higher speed after discovery. This code *also* checks for valid WLED
+version handshake on every boot, to discover cases where the device has lingered
+in the non-default speed.
+
+Third, WLED is an abstraction that also supports Gamma or other transforms. Please be thoughtful
+so you do gamma correct, but don't gamma correct twice, if OPCS supports gamma.
 
 ## Protocols
 
@@ -197,7 +258,10 @@ AdaLight is a simple serial protocol developed for Arduino-based LED controllers
 
 The LED count field (bytes 3-4) contains **(actual_led_count - 1)**, NOT the actual count.
 
-This matches the AWA protocol convention and is essential for proper frame synchronization. Sending the wrong count will cause the receiver to expect the wrong number of bytes, leading to frame desync and potential interpretation of pixel data as commands.
+This matches the AWA protocol convention and is essential for proper frame synchronization. Sending the wrong count will cause the receiver to expect the wrong number of bytes, leading to frame desync and potential interpretation of pixel data as commands. 
+
+If using WLED, the dangerous byte is "change serial port speed" which if sent outside a data frame leads 
+to what seems like a non-responsive controller until reboot (although it is responsive, just on a different baud).
 
 **Examples:**
 - 1 LED → send `0x00 0x00` (value 0)
@@ -213,7 +277,10 @@ Total frame size = 6 bytes (header) + (led_count × 3) bytes (pixel data)
 
 ### AWA Protocol
 
-AWA (Advanced Wireless Addressable) is another serial protocol for LED control with additional features for timing and synchronization. This project has been tested with HyperSerialPico implementing the AWA protocol.
+AWA (Advanced Wireless Addressable) is another serial protocol for LED control with additional features for timing and synchronization. This project has been tested with HyperSerialPico implementing the AWA protocol. It appears
+only that github author has written AWA, which they use with their control software "HyperHDR".
+
+In general, it seems Adalight may be a better protocol, as it is simply more common.
 
 ### WLED Serial Protocol
 
@@ -222,18 +289,22 @@ WLED is popular ESP32/ESP8266 firmware for controlling addressable LEDs. When co
 #### Supported Protocols
 WLED devices support these serial protocols:
 - **AdaLight** - Standard AdaLight protocol (same format as above)
-- **TPM2** - Alternative streaming protocol
+- **TPM2** - Alternative streaming protocol (not well tested by this code)
 - **JSON API** - Configuration and state queries (WLED-specific)
 
 #### Baud Rate Switching
 
-WLED has a critical feature for optimal performance: **dynamic baud rate switching**. This allows initial handshaking at a standard speed, then switching to higher speeds for LED data transmission.
+WLED has a critical feature for optimal performance: **dynamic baud rate switching**. This allows initial handshaking at a standard speed, then switching to higher speeds for LED data transmission. The initial
+handshake speed is set persistantly **ONLY** through the web interface.
+
+This feature of Baud Rate Switching is *ONLY* done when the hardware type is WLED. If the device
+is ADALIGHT but has any other hardware string, the feature is not attempted.
 
 **Why This Matters:**
-- WLED defaults to 115200 baud for JSON API communication
-- LED data transmission can benefit from higher speeds (up to 2Mbps)
+- WLED defaults to 115200 baud for JSON API and discovery
+- LED data transmission can benefit from higher speeds (these cheap embedded controlers are stable at 230k or 500k)
 - Baud rate changes are **temporary** and reset on power cycle
-- Must detect the default baud rate before attempting to change it
+- Must detect the default baud rate before attempting to use the controller
 
 **Baud Rate Change Commands:**
 
@@ -336,35 +407,6 @@ let mut port = serialport::new(port_name, 2000000).open()?;
 // Now send AdaLight frames...
 ```
 
-## Supported LED Types
-
-- WS2812/WS2812B (NeoPixel)
-- WS2811
-- APA102 (via compatible controllers)
-- SK6812
-- And other addressable RGB(W) LED strips
-
-## Performance
-
-- Supports high frame rates (limited by serial bandwidth and LED strip refresh rates)
-- Minimal latency (typically <10ms for translation)
-- Efficient multi-port handling
-- Rust implementation provides maximum performance for demanding installations
-
-## Roadmap
-
-- [x] Core OPC server implementation (Python)
-- [x] Core OPC server implementation (Rust)
-- [x] AdaLight protocol output
-- [x] AWA protocol output
-- [x] Multi-port management
-- [x] Command-line interface
-- [ ] Cross-platform testing (Windows, macOS, Linux)
-- [ ] Raspberry Pi optimization
-- [ ] Systemd service files
-- [ ] Performance benchmarking
-- [x] Documentation and examples
-
 ## Contributing
 
 Contributions are welcome! Please feel free to submit pull requests or open issues for bugs and feature requests.
@@ -392,8 +434,8 @@ See [LICENSE](LICENSE) file for details.
 
 ## Contact
 
-For questions, issues, or contributions, please use the GitHub issue tracker.
+For questions, issues, or contributions, please use the GitHub issue tracker and author bbulkow (brian@bulkowski.org)
 
 ---
 
-**Status**: 🚧 Under Active Development 🚧
+**Status**: 🚧 may or may not respond to bugs 🚧
